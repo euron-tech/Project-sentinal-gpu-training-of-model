@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data / outputs (keep them out of the image layer)
+data/output/
+output/
+logs/
+*.parquet
+*.csv
+
+# Docker
+Dockerfile
+.dockerignore
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Machine learning checkpoints (large)
+*.bin
+*.pt
+*.pth
+
+# Git
+.git/
+
+# Documentation
+*.md
+EURON.md
+
+# Third-party
+THIRD_PARTY_NOTICES.md

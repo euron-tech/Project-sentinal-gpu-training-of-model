@@ -1,0 +1,25 @@
+# SENTINEL — Fraud Detection Fine-tuning
+# ----------------------------------------
+# CPU-compatible dependencies (no bitsandbytes)
+# ----------------------------------------
+
+# Core ML / NLP
+transformers>=4.37.0,<4.40
+peft>=0.6.0,<0.7
+# torch is installed from PyTorch's CPU-only index in the Dockerfile
+# Do NOT include bitsandbytes — it is CUDA-only
+
+# Data / processing
+datasets>=2.15.0
+pandas>=2.0.0
+numpy>=2.0.0
+
+# Storage / IO
+supabase>=2.0.0
+requests>=2.31.0
+
+# Utilities
+scikit-learn>=1.3.0
+python-dotenv>=1.0.0
+sentencepiece>=0.1.99
+accelerate>=0.25.0
