@@ -67,9 +67,10 @@ def build_model(base_model: str, method: str = "lora", r: int = 16, alpha: int =
     tok = load_tokenizer(base_model)
     model = load_base(base_model, method, tok.pad_token_id)
     if method == "qlora":
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing,
+                                                gradient_checkpointing_kwargs={"use_reentrant": False})
     elif gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
     cfg = LoraConfig(
         task_type=TaskType.SEQ_CLS,
@@ -112,14 +113,30 @@ def load_trained(run_dir: str, device: Optional[str] = None):
 @torch.no_grad()
 def predict_logits(model, tokenizer, prompts: List[str], max_length: int = 512,
                    batch_size: int = 32) -> torch.Tensor:
-    """Return [N, NUM_LABELS] float32 logits. Batches are length-sorted for speed."""
+    """Return [N, NUM_LABELS] float32 logits (input order). Batches are length-sorted for speed."""
+    import contextlib
+
     model.eval()
     device = next(model.parameters()).device
-    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+    # Autocast keeps an fp32 head and a bf16/fp16 body compatible outside the Trainer.
+    amp = (torch.autocast("cuda", dtype=pick_dtype()) if device.type == "cuda"
+           else contextlib.nullcontext())
+    # Longest first: the first batch reserves the biggest blocks and later batches reuse them.
+    # Shortest-first fragments the CUDA cache (11.8 GiB reserved vs 1.7 GiB measured on QLoRA).
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]), reverse=True)
     out = torch.empty(len(prompts), NUM_LABELS)
-    for s in range(0, len(order), batch_size):
-        idx = order[s:s + batch_size]
-        enc = tokenizer([prompts[i] for i in idx], truncation=True, max_length=max_length,
-                        padding=True, return_tensors="pt").to(device)
-        out[idx] = model(**enc).logits.float().cpu()
+    import time
+
+    n_batches = (len(order) + batch_size - 1) // batch_size
+    every = max(1, n_batches // 10) if len(prompts) >= 2000 else 0
+    t0 = time.time()
+    with amp:
+        for b, s in enumerate(range(0, len(order), batch_size), 1):
+            idx = order[s:s + batch_size]
+            enc = tokenizer([prompts[i] for i in idx], truncation=True, max_length=max_length,
+                            padding=True, return_tensors="pt").to(device)
+            out[idx] = model(**enc).logits.float().cpu()
+            if every and (b % every == 0 or b == n_batches):
+                done = min(s + batch_size, len(order))
+                logger.info("Scoring %d/%d rows (%.0f rows/s)", done, len(order), done / max(1e-6, time.time() - t0))
     return out

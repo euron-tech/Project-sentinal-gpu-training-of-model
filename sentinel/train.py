@@ -111,9 +111,10 @@ def parse_args(argv=None):
     p.add_argument("--max-train-rows", type=int, default=0, help="Cap training rows after balancing")
     p.add_argument("--max-eval-rows", type=int, default=20000,
                    help="Stratified cap for validation/holdout scoring (0 = all)")
-    p.add_argument("--eval-batch-size", type=int, default=64)
+    p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--skip-holdout", action="store_true")
-    p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True,
+                   help="Recompute activations: ~6x less GPU memory, ~30%% slower (default on)")
     p.add_argument("--target-recall", type=float, default=0.85)
     p.add_argument("--target-precision", type=float, default=0.70)
     p.add_argument("--seed", type=int, default=42)
@@ -183,7 +184,21 @@ def run(a) -> Path:
     t0 = time.time()
     result = trainer.train()
     train_s = time.time() - t0
-    logger.info("Training done in %.1fs, loss=%.4f", train_s, result.training_loss)
+    peak_gb = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+    logger.info("Training done in %.1fs, loss=%.4f, peak GPU memory %.1f GiB",
+                train_s, result.training_loss, peak_gb)
+    log_history = trainer.state.log_history
+
+    # Release optimizer state, gradients and cached blocks before scoring; otherwise a 24 GB card
+    # stays full and evaluation crawls (Windows pages VRAM to system RAM).
+    import gc
+
+    model.zero_grad(set_to_none=True)
+    trainer.accelerator.free_memory()
+    del trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ---- save
     model.save_pretrained(run_dir / "adapter")
@@ -196,7 +211,7 @@ def run(a) -> Path:
         "args": vars(a),
     }
     (run_dir / "sentinel_config.json").write_text(json.dumps(meta, indent=2))
-    (run_dir / "train_log.json").write_text(json.dumps(trainer.state.log_history, indent=2))
+    (run_dir / "train_log.json").write_text(json.dumps(log_history, indent=2))
 
     # ---- validation: calibrate + thresholds
     model.eval()
