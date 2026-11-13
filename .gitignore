@@ -32,3 +32,6 @@ __pycache__/
 .pytest_cache/
 data/
 output/
+
+# Client documents (confidential)
+*.docx

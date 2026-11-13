@@ -44,3 +44,28 @@ def test_train_eval_infer(fake_data_dir, tmp_path, method):
                         "[TXN] id=TX_B amt=120.0 mcc=grocery channel=UPI time=14h Mon\n[TASK] Assess."])
     assert len(out) == 2 and all(validate_response(r) for r in out)
     assert out[0]["transaction_id"] == "TX_A"
+
+    # ---- HTTP server: auth, scoring, test page, health
+    import threading
+
+    import requests
+
+    from sentinel.infer import make_server
+
+    srv = make_server(scorer, "127.0.0.1", 0, api_key="secret")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        txn = {"transaction_id": "TX_HTTP", "amount": 75000, "hour": 3, "new_device": True}
+        assert requests.post(f"{base}/score", json=txn, timeout=30).status_code == 401
+        r = requests.post(f"{base}/score", json=txn, headers={"X-API-Key": "secret"}, timeout=30)
+        assert r.status_code == 200 and validate_response(r.json()["results"][0])
+        r = requests.post(f"{base}/score", json={"transactions": [txn, txn]},
+                          headers={"X-API-Key": "secret"}, timeout=30)
+        assert len(r.json()["results"]) == 2
+        assert requests.post(f"{base}/score", json={"x": 1}, headers={"X-API-Key": "secret"},
+                             timeout=30).status_code == 400
+        assert "SENTINEL" in requests.get(base, timeout=30).text
+        assert requests.get(f"{base}/health", timeout=30).json()["auth_required"] is True
+    finally:
+        srv.shutdown()

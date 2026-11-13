@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -157,24 +158,56 @@ class SentinelScorer:
 
 
 # ------------------------------------------------------------------ server
-def serve(scorer: SentinelScorer, host: str, port: int):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+TEST_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>SENTINEL test</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 16px}
+textarea,input{width:100%;box-sizing:border-box;font:13px monospace}textarea{height:190px}
+button{margin:8px 0;padding:8px 16px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
+<body><h2>SENTINEL fraud scoring</h2>
+<label>API key <input id="k" type="password" placeholder="X-API-Key (if the server requires one)"></label>
+<p>Transaction JSON (structured fields, or {"prompt": "..."}):</p>
+<textarea id="t">{"transaction_id":"TX_DEMO","amount":75000,"mcc":"electronics","channel":"card","hour":3,
+ "weekday":"Sun","customer_age":24,"account_age_days":6,"avg_90d":1800,"txns_30d":2,"fails_24h":4,
+ "new_device":true,"city":"Pune","merchant_city":"Delhi","new_city":true,"dist_km":"1000+",
+ "amt_ratio":41.7,"txns_1h":3,"amount_24h":12000,"device_users_7d":2}</textarea>
+<button onclick="go()">Score</button><pre id="o"></pre>
+<script>async function go(){const o=document.getElementById('o');o.textContent='...';
+try{const r=await fetch('score',{method:'POST',headers:{'Content-Type':'application/json',
+'X-API-Key':document.getElementById('k').value},body:document.getElementById('t').value});
+o.textContent=r.status+' '+JSON.stringify(await r.json(),null,2)}catch(e){o.textContent=e}}</script>
+</body></html>"""
+
+
+def make_server(scorer: SentinelScorer, host: str, port: int, api_key: Optional[str] = None):
+    """Build (not start) the HTTP server.
+
+    GET  /        browser test page
+    GET  /health  status + thresholds (no auth)
+    POST /score   {"prompt": ...} | {structured fields} | {"transactions": [...]}
+    If api_key is set, POST /score requires header  X-API-Key: <key>.
+    """
+    import hmac
     import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     lock = threading.Lock()
+    max_body = 1 << 20
 
     class H(BaseHTTPRequestHandler):
-        def _send(self, code, body):
-            data = json.dumps(body).encode()
+        def _send(self, code, body, ctype="application/json"):
+            data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
             self.send_response(code)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.path == "/health":
-                self._send(200, {"status": "ok", "run": scorer.run.name,
+            if self.path in ("/", "/index.html"):
+                self._send(200, TEST_PAGE, "text/html; charset=utf-8")
+            elif self.path == "/health":
+                self._send(200, {"status": "ok", "run": scorer.run.name, "auth_required": bool(api_key),
+                                 "device": str(next(scorer.model.parameters()).device),
                                  "thresholds": {k: scorer.cal[k] for k in ("review_threshold", "block_threshold")}})
             else:
                 self._send(404, {"error": "not found"})
@@ -182,22 +215,36 @@ def serve(scorer: SentinelScorer, host: str, port: int):
         def do_POST(self):
             if self.path != "/score":
                 return self._send(404, {"error": "not found"})
+            if api_key and not hmac.compare_digest(self.headers.get("X-API-Key", ""), api_key):
+                return self._send(401, {"error": "missing or invalid X-API-Key"})
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                n = int(self.headers.get("Content-Length", 0))
+                if n > max_body:
+                    return self._send(413, {"error": "body too large"})
+                body = json.loads(self.rfile.read(n) or b"{}")
                 items = body.get("transactions") or [body]
+                if len(items) > 256:
+                    return self._send(413, {"error": "max 256 transactions per request"})
                 t0 = time.perf_counter()
                 with lock:
                     res = scorer.score(items)
                 ms = (time.perf_counter() - t0) * 1000
                 self._send(200, {"results": res, "latency_ms": round(ms, 2)})
-            except (KeyError, ValueError, TypeError) as e:
-                self._send(400, {"error": str(e)})
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
+                self._send(400, {"error": f"bad request: {e}"})
 
-        def log_message(self, fmt, *args):
-            logger.info("%s %s", self.address_string(), fmt % args)
+        def log_message(self, format, *args):  # noqa: A002
+            logger.info("%s %s", self.address_string(), format % args)
 
-    srv = ThreadingHTTPServer((host, port), H)
-    logger.info("Serving on http://%s:%d  (POST /score, GET /health)", host, port)
+    return ThreadingHTTPServer((host, port), H)
+
+
+def serve(scorer: SentinelScorer, host: str, port: int, api_key: Optional[str] = None):
+    if host not in ("127.0.0.1", "localhost") and not api_key:
+        logger.warning("Serving on %s WITHOUT an API key - anyone who can reach this port can call it. "
+                       "Set SENTINEL_API_KEY or --api-key.", host)
+    srv = make_server(scorer, host, port, api_key)
+    logger.info("Serving on http://%s:%d  (GET / test page, GET /health, POST /score)", host, port)
     srv.serve_forever()
 
 
@@ -217,11 +264,12 @@ def main(argv=None):
     s = sub.add_parser("file"); s.add_argument("path")
     s = sub.add_parser("latency"); s.add_argument("--n", type=int, default=50); s.add_argument("--data-dir", default="data/sft")
     s = sub.add_parser("serve"); s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8000)
+    s.add_argument("--api-key", default=os.getenv("SENTINEL_API_KEY"), help="Require X-API-Key (default: $SENTINEL_API_KEY)")
     a = p.parse_args(argv)
 
     scorer = SentinelScorer(a.run, a.review_threshold, a.block_threshold)
     if a.cmd == "serve":
-        return serve(scorer, a.host, a.port)
+        return serve(scorer, a.host, a.port, a.api_key)
     if a.cmd == "prompt":
         print(json.dumps(scorer.score([a.text])[0], indent=2))
     elif a.cmd == "file":
