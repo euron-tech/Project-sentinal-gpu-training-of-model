@@ -19,7 +19,8 @@ if tmux has-session -t train 2>/dev/null; then
 fi
 mkdir -p output
 : > output/last_train.log
-tmux new-session -d -s train "bash hyperstack/_tmux_run.sh train $(printf '%q ' "$@")"
+ARGS=""; [ $# -gt 0 ] && ARGS=$(printf ' %q' "$@")
+tmux new-session -d -s train "bash hyperstack/_tmux_run.sh train$ARGS"
 sleep 8
 if ! tmux has-session -t train 2>/dev/null || grep -q -E "Traceback|finished with exit code [1-9]" output/last_train.log 2>/dev/null; then
   echo "Training failed to start:"; tail -n 30 output/last_train.log; exit 1
