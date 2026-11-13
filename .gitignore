@@ -24,3 +24,11 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Python / ML artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+output/
