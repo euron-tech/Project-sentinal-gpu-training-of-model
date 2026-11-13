@@ -208,7 +208,7 @@ def run(a) -> Path:
            "calibrated": classification_metrics(probs, labels, cal["review_threshold"], cal["block_threshold"]),
            "reasons": reason_metrics(logits[:, 1:], reasons)}
     (run_dir / "metrics_validation.json").write_text(json.dumps(val, indent=2))
-    logger.info("Validation: %s", json.dumps(val["calibrated"]))
+    logger.info("Validation: %s", json.dumps({k: v for k, v in val["calibrated"].items() if k != "curves"}))
 
     # ---- holdout (acceptance split, thresholds frozen from validation)
     if not a.skip_holdout:
@@ -219,7 +219,7 @@ def run(a) -> Path:
               "calibrated": classification_metrics(probs, labels, cal["review_threshold"], cal["block_threshold"]),
               "reasons": reason_metrics(logits[:, 1:], reasons)}
         (run_dir / "metrics_holdout.json").write_text(json.dumps(ho, indent=2))
-        logger.info("Holdout: %s", json.dumps(ho["calibrated"]))
+        logger.info("Holdout: %s", json.dumps({k: v for k, v in ho["calibrated"].items() if k != "curves"}))
 
     logger.info("Artifacts in %s", run_dir)
     print(str(run_dir))

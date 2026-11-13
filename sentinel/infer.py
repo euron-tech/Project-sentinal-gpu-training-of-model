@@ -147,6 +147,25 @@ class SentinelScorer:
         probs = apply_platt(logits[:, 0], self.cal)
         return [to_response(p, lg[1:], self.cal, i) for p, lg, i in zip(probs, logits, ids)]
 
+    def stats(self) -> Dict:
+        """Everything the dashboard shows: run info, calibration, metrics, loss curve."""
+        def read(name):
+            p = self.run / name
+            return json.loads(p.read_text()) if p.exists() else None
+
+        log = read("train_log.json") or []
+        keep = ("base_model", "method", "device", "host", "train_runtime_s", "train_loss",
+                "train_rows", "max_length", "reason_codes")
+        return {
+            "kind": "llm",
+            "model": f"{self.meta['base_model']} + {self.meta['method'].upper()}",
+            "run": self.run.name,
+            "info": {k: self.meta.get(k) for k in keep},
+            "calibration": self.cal,
+            "metrics": {"validation": read("metrics_validation.json"), "holdout": read("metrics_holdout.json")},
+            "loss_curve": [{"step": e["step"], "loss": e["loss"]} for e in log if "loss" in e],
+        }
+
     def latency_ms(self, prompt: str, n: int = 20) -> Dict[str, float]:
         self.score([prompt])  # warm-up
         ts = []
@@ -209,6 +228,10 @@ def make_server(scorer: SentinelScorer, host: str, port: int, api_key: Optional[
                 self._send(200, {"status": "ok", "run": scorer.run.name, "auth_required": bool(api_key),
                                  "device": str(next(scorer.model.parameters()).device),
                                  "thresholds": {k: scorer.cal[k] for k in ("review_threshold", "block_threshold")}})
+            elif self.path == "/stats":
+                if api_key and not hmac.compare_digest(self.headers.get("X-API-Key", ""), api_key):
+                    return self._send(401, {"error": "missing or invalid X-API-Key"})
+                self._send(200, scorer.stats())
             else:
                 self._send(404, {"error": "not found"})
 

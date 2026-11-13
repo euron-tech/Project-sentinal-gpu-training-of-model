@@ -1,123 +1,120 @@
-# SENTINEL — LoRA / QLoRA fraud scoring on Qwen2.5 (Hyperstack GPU)
-
-Fine-tunes `Qwen/Qwen2.5-0.5B-Instruct` to read a serialized transaction plus the customer's
-recent history and return:
-
-```json
-{"transaction_id": "TX_…", "fraud_probability": 0.91, "decision": "BLOCK",
- "confidence": 0.91, "reason_codes": ["R01_NEW_DEVICE", "R03_ODD_HOUR"],
- "explanation": "Blocked: new device, unusual hour."}
-```
-
-The LLM gets a 9-way head: one fraud logit (Platt-calibrated on validation) plus eight reason-code
-logits. LoRA goes on all linear layers. QLoRA loads the base in 4-bit NF4. Thresholds are
-picked on validation (REVIEW: recall ≥ 0.85, BLOCK: precision ≥ 0.70), then frozen for holdout and serving.
-
-Data: the prebuilt splits in the Supabase bucket `sentinel-data/training/sft/{train,validation,holdout}`
-(train Jan–Oct 2025, validation Nov–Dec 2025, holdout Jan–Feb 2026, ~0.6 % fraud), downloaded to `data/sft/`.
+# SENTINEL — fraud-scoring LLM, XGBoost benchmark, and dashboard
 
 ```
-sentinel/    data.py  model.py  train.py  evaluate.py  infer.py (CLI + HTTP server)
-hyperstack/  setup_vm.sh  train.sh  serve.sh   (run ON the VM)
-             remote.sh                         (optional: drive the VM from your PC over SSH)
-tests/       unit tests + tiny-model LoRA/QLoRA train → eval → infer → HTTP smoke test
+ Hyperstack GPU VM                 Your machine                         Anyone with the links
+ ┌───────────────────────┐        ┌────────────────────────────┐       ┌──────────────────────┐
+ │ LLM API  :8000        │        │ XGBoost API :8001 ──ngrok──┼──────▶│ Streamlit dashboard  │
+ │ Qwen2.5-0.5B + LoRA   │◀───────┼────────────────────────────┼───────│ :8501 (local, Docker │
+ │ sentinel/ + hyperstack│  HTTP  │ xgboost_benchmark/         │       │  or any host)  ui/   │
+ └───────────────────────┘        └────────────────────────────┘       └──────────────────────┘
+        Dockerfile.llm                xgboost_benchmark/Dockerfile          ui/Dockerfile
 ```
+
+All three services share one contract: `POST /score` takes `{"prompt"}` or structured fields or
+`{"transactions":[...]}` and returns
+`{transaction_id, fraud_probability, decision: ALLOW|REVIEW|BLOCK, confidence, reason_codes, explanation}`.
+`GET /stats` returns metrics (incl. PR/ROC curves), calibration and model info. Auth uses the `X-API-Key` header.
+
+| Folder | What | Runs on |
+|---|---|---|
+| `sentinel/`, `hyperstack/`, `tests/`, `Dockerfile.llm` | LLM training (LoRA/QLoRA), eval, GPU inference API | Hyperstack GPU |
+| `xgboost_benchmark/` | XGBoost baseline: same splits, prompts, and protocol; API with samples and scenarios | Your machine (via ngrok) |
+| `ui/` | iOS-style Streamlit dashboard: stats, benchmark, live and batch tests | Anywhere |
+
+Both models use the same protocol. They train on `train` (Jan–Oct 2025), then early-stop, calibrate, and pick
+thresholds on `validation` (REVIEW: recall ≥ 0.85, BLOCK: precision ≥ 0.70). Holdout metrics (Jan–Feb 2026)
+use those frozen thresholds. Data comes from the Supabase bucket `sentinel-data/training/sft/*`.
 
 ---
 
-## Run everything on a Hyperstack GPU VM
+## A. LLM on the Hyperstack GPU
 
-### 0. Launch the VM (Hyperstack console)
-- Any single-GPU NVIDIA flavor, an Ubuntu image with NVIDIA drivers/CUDA, your SSH key, public IP on.
-- Firewall rules, inbound TCP: **22** (SSH) and **8000** (test API). Restrict 8000 to your testers' IPs if you can.
+**Console:** single-GPU NVIDIA VM, an Ubuntu image with NVIDIA drivers/CUDA, your SSH key, public IP.
+Open inbound TCP **22** and **8000**.
 
-### 1. SSH in and clone
 ```bash
 ssh ubuntu@<VM_IP>
-nvidia-smi                                   # GPU must be listed
-git clone https://github.com/euron-tech/Project-sentinal-gpu-training-of-model.git sentinel
-cd sentinel
-```
-
-### 2. Create `.env` on the VM (never committed)
-```bash
-cp .env.example .env
-nano .env        # set SUPABASE_URL and SUPABASE_KEY (SUPABASE_BUCKET=sentinel-data)
-```
-
-### 3. Install + download data (one time, ~5–10 min)
-```bash
-bash hyperstack/setup_vm.sh                  # ends with: torch … cuda True <GPU> / VM ready.
+git clone https://github.com/euron-tech/Project-sentinal-gpu-training-of-model.git sentinel && cd sentinel
+cp .env.example .env && nano .env                # SUPABASE_URL, SUPABASE_KEY
+bash hyperstack/setup_vm.sh                      # venv, CUDA torch, deps, data -> "VM ready."
 source .venv/bin/activate
-```
+python -m pytest -q tests                        # 15 passed (LoRA + QLoRA + HTTP smoke on the GPU)
 
-### 4. Test the pipeline on the GPU (~1 min)
-```bash
-python -m pytest -q                          # expect: 15 passed
-```
+bash hyperstack/train.sh --method lora           # or --method qlora; runs in tmux
+tail -f output/last_train.log                    # done at "Artifacts in output/<run>"
 
-### 5. Train
-```bash
-bash hyperstack/train.sh --method lora       # or --method qlora; any sentinel.train flag works
-tail -f output/last_train.log                # Ctrl-C stops only the tail; training keeps running
-```
-Training is done when the log prints `Holdout: {...}` and `Artifacts in output/<run>`.
-Each run folder holds `adapter/`, `calibration.json`, `metrics_validation.json`, `metrics_holdout.json`, `train_log.json`.
-
-### 6. Evaluate + inference on the VM GPU
-```bash
 RUN=$(ls -1dt output/*/ | head -1)
 python -m sentinel.evaluate --run $RUN --split holdout
-python -m sentinel.infer --run $RUN sample --split holdout --n 5
 python -m sentinel.infer --run $RUN sample --split holdout --n 5 --fraud-only
-python -m sentinel.infer --run $RUN latency --n 50
-```
 
-### 7. Make it available to testers
+PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh       # GPU API on :8000 in tmux; prints URL + API key
+```
+Check from your PC: `curl http://<VM_IP>:8000/health` (should show `"device": "cuda:0"`).
+To update: `git pull && bash hyperstack/setup_vm.sh`, retrain or re-serve. **Hibernate the VM when done.**
+
+## B. XGBoost benchmark on your machine (Windows/Linux)
+
+The model is already trained and committed (`xgboost_benchmark/artifacts/`, holdout PR-AUC 0.215, ROC-AUC 0.973).
+To keep it running all the time (Docker, auto-restart; prints the URL and API key):
+```powershell
+powershell -ExecutionPolicy Bypass -File xgboost_benchmark\run_service.ps1
+ngrok http 8001                                  # share the https URL + key with the dashboard
+```
+Or retrain or run it without Docker:
 ```bash
-PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh   # GPU server on 0.0.0.0:8000 in tmux, prints the API key
+# from the repo root, with the venv active (or: pip install -r xgboost_benchmark/requirements.txt)
+cd xgboost_benchmark
+python train.py                                  # ~1 min CPU; writes artifacts/ (already committed)
+python -m pytest -q tests                        # 5 passed
+# PowerShell:  $env:XGB_API_KEY = "<pick a long random key>"     bash:  export XGB_API_KEY=...
+uvicorn server:app --host 127.0.0.1 --port 8001
 ```
-Share the URL and the API key with testers:
-- **Browser:** `http://<VM_IP>:8000/`. Paste the key and press **Score**.
-- **curl:**
-  ```bash
-  curl -s http://<VM_IP>:8000/health
-  curl -s http://<VM_IP>:8000/score -H "X-API-Key: <KEY>" -H "Content-Type: application/json" \
-    -d '{"transaction_id":"TX1","amount":75000,"hour":3,"new_device":true,"fails_24h":4,"account_age_days":6}'
-  curl -s http://<VM_IP>:8000/score -H "X-API-Key: <KEY>" -H "Content-Type: application/json" \
-    -d '{"transactions":[{"amount":250,"hour":14},{"amount":90000,"hour":2,"new_device":true}]}'
-  ```
-- **Python:** `requests.post(url + "/score", json=txn, headers={"X-API-Key": KEY}).json()`
-
-Input fields: `transaction_id, amount, mcc, channel, hour, weekday, customer_age, account_age_days,
-avg_90d, txns_30d, fails_24h, new_device, city, merchant_city, new_city, dist_km, amt_ratio, txns_1h,
-amount_24h, device_users_7d, history[{days_ago, channel, amount, mcc, city}]`, or `{"prompt": "<fmt-v1 text>"}`.
-
-Server control: `tmux attach -t serve` (detach Ctrl-B D) · `tail -f output/serve.log` · stop with `tmux kill-session -t serve`.
-Plain HTTP with a shared key is meant for testing only. Put it behind HTTPS before using it for anything real.
-
-### 8. Update code / stop
+Expose it in a second terminal:
 ```bash
-git pull && bash hyperstack/setup_vm.sh      # after pushing new code
+ngrok http 8001                                  # copy the https://<id>.ngrok-free.app URL
+curl https://<id>.ngrok-free.app/health
 ```
-**Hibernate or delete the VM in the console when finished.** It bills by the hour.
 
----
+## C. Dashboard
+
+```bash
+pip install -r ui/requirements.txt               # already in the root .venv
+# PowerShell: $env:LLM_URL="http://<VM_IP>:8000"; $env:LLM_API_KEY="<from serve.sh>"
+#             $env:XGB_URL="https://<id>.ngrok-free.app"; $env:XGB_API_KEY="<your key>"
+streamlit run ui/app.py                          # http://localhost:8501 (URLs/keys can also be set in the sidebar)
+python -m pytest -q ui/tests                     # headless render test (set UI_TEST_* for the live variant)
+```
+Tabs: **Overview** (holdout KPIs and acceptance targets OBJ-01/02/03/04/10) · **LLM** (run info, loss, thresholds,
+reason-code F1) · **Benchmark** (PR/ROC overlays, operating points, uplift, feature importance) · **Live Test**
+(scenario presets, a custom form, or a raw prompt, scored on both models with latency) · **Batch Test** (labelled
+samples from the XGBoost service or an uploaded JSONL/CSV, with sample metrics and a CSV export).
+
+To share the dashboard with others: run `ngrok http 8501` too, or deploy the `ui/` Docker image anywhere.
+
+## Docker (each service deploys on its own)
+
+```bash
+docker build -t sentinel-xgb xgboost_benchmark   # XGBoost API (model baked in)
+docker run -d -p 8001:8001 -e XGB_API_KEY=... -v "$PWD/data/sft:/data/sft" sentinel-xgb
+
+docker build -t sentinel-ui ui                   # dashboard
+docker run -d -p 8501:8501 -e LLM_URL=http://<VM_IP>:8000 -e LLM_API_KEY=... \
+           -e XGB_URL=https://<id>.ngrok-free.app -e XGB_API_KEY=... sentinel-ui
+
+docker build -f Dockerfile.llm -t sentinel-llm . # LLM API, on a GPU host with NVIDIA Container Toolkit
+docker run -d --gpus all -p 8000:8000 -e SENTINEL_API_KEY=... -v "$PWD/output:/app/output" \
+           sentinel-llm --run output/<run> serve --host 0.0.0.0 --port 8000
+```
+Or use compose: `docker compose up -d --build xgboost ui` (your machine), then
+`docker compose --profile gpu up -d --build llm` (GPU host, set `LLM_RUN=<run>` in `.env`).
 
 ## Troubleshooting
 | Symptom | Fix |
 |---|---|
-| `setup_vm.sh`: `cuda False` / torch import error | Driver too old for cu126 wheels. Use an image with a newer driver, or `TORCH_INDEX=https://download.pytorch.org/whl/cu128 bash hyperstack/setup_vm.sh` |
-| `SUPABASE_URL and SUPABASE_KEY must be set` | Fill in `.env` in the repo folder |
-| CUDA out of memory | `--batch-size 8 --grad-accum 2`, or `--method qlora` |
-| apt lock during setup | Fresh VM still self-updating. Wait, then re-run |
-| Testers can't reach :8000 | Add the inbound TCP 8000 firewall rule; check `tmux ls` shows `serve` |
-| 401 from /score | Missing or wrong `X-API-Key`; see `grep SENTINEL_API_KEY .env` on the VM |
+| Dashboard shows LLM offline | VM firewall needs TCP 8000; `tmux ls` on the VM should list `serve`; check the key |
+| XGBoost offline via ngrok | Is `uvicorn` still running? Is the ngrok URL current (it changes on restart)? Is `XGB_API_KEY` the same? |
+| 401 | Wrong or missing API key in the sidebar |
+| `setup_vm.sh`: `cuda False` | Image driver too old. Use a newer image, or `TORCH_INDEX=https://download.pytorch.org/whl/cu128` |
+| CUDA OOM while training | `--batch-size 8 --grad-accum 2` or `--method qlora` |
 
-## Local GPU (optional)
-```bash
-python -m venv .venv && .venv/Scripts/activate      # Linux: source .venv/bin/activate
-pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt && python -m pytest -q
-```
-`hyperstack/remote.sh` can also push, set up, train, and pull from your PC over SSH; see the header of that file.
+Plain HTTP with shared keys is for testing only. Put the APIs behind HTTPS before using real data.

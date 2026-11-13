@@ -81,12 +81,31 @@ def ece(probs: np.ndarray, labels: np.ndarray, bins: int = 15) -> float:
     return float(total)
 
 
+def _thin(xs, ys, n: int = 200):
+    idx = np.unique(np.linspace(0, len(xs) - 1, min(n, len(xs))).astype(int))
+    return [round(float(v), 5) for v in np.asarray(xs)[idx]], [round(float(v), 5) for v in np.asarray(ys)[idx]]
+
+
+def curves(probs: np.ndarray, labels: np.ndarray) -> Dict:
+    """Down-sampled PR and ROC curve points (for dashboards)."""
+    from sklearn.metrics import precision_recall_curve, roc_curve
+
+    if len(np.unique(labels)) < 2:
+        return {}
+    p, r, _ = precision_recall_curve(labels, probs)
+    fpr, tpr, _ = roc_curve(labels, probs)
+    rx, py = _thin(r, p)
+    fx, ty = _thin(fpr, tpr)
+    return {"pr": {"recall": rx, "precision": py}, "roc": {"fpr": fx, "tpr": ty}}
+
+
 def classification_metrics(probs: np.ndarray, labels: np.ndarray,
                            review_thr: float, block_thr: float) -> Dict:
     from sklearn.metrics import average_precision_score, roc_auc_score
 
     both = len(np.unique(labels)) == 2
     return {
+        "curves": curves(probs, labels),
         "rows": int(len(labels)),
         "fraud_rows": int(labels.sum()),
         "pr_auc": float(average_precision_score(labels, probs)) if both else None,

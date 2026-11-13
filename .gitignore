@@ -35,3 +35,6 @@ output/
 
 # Client documents (confidential)
 *.docx
+
+# XGBoost benchmark local data (artifacts/ IS committed)
+xgboost_benchmark/data/
