@@ -29,28 +29,32 @@ use those frozen thresholds. Data comes from the Supabase bucket `sentinel-data/
 
 ## A. LLM on the Hyperstack GPU
 
-**Console:** single-GPU NVIDIA VM, an Ubuntu image with NVIDIA drivers/CUDA, your SSH key, public IP.
-Open inbound TCP **22** and **8000**.
+**Console:** single-GPU NVIDIA VM (any card with ≥ 16 GB works; training needs only about 2.5 GB), an Ubuntu image with
+NVIDIA drivers/CUDA, your SSH key, public IP. Open inbound TCP **22** and **8000**.
 
 ```bash
 ssh ubuntu@<VM_IP>
 git clone https://github.com/euron-tech/Project-sentinal-gpu-training-of-model.git sentinel && cd sentinel
 cp .env.example .env && nano .env                # SUPABASE_URL, SUPABASE_KEY
-bash hyperstack/setup_vm.sh                      # venv, CUDA torch, deps, data -> "VM ready."
-source .venv/bin/activate
-python -m pytest -q tests                        # 15 passed (LoRA + QLoRA + HTTP smoke on the GPU)
+bash hyperstack/setup_vm.sh                      # apt, venv, CUDA torch (auto-fallback), deps, data, Qwen weights -> "VM ready."
+bash hyperstack/check.sh --full                  # GPU, torch, data, model, 15 tests -> "ALL GOOD"
 
-bash hyperstack/train.sh --method lora           # or --method qlora; runs in tmux
+bash hyperstack/train.sh                         # LoRA, full run: ~5 min train + ~3 min eval on a 4090-class GPU
+bash hyperstack/train.sh --method qlora          # 4-bit QLoRA variant
+bash hyperstack/train.sh --max-steps 30 --max-eval-rows 2000   # 1-minute demo run
 tail -f output/last_train.log                    # done at "Artifacts in output/<run>"
 
+source .venv/bin/activate
 RUN=$(ls -1dt output/*/ | head -1)
 python -m sentinel.evaluate --run $RUN --split holdout
 python -m sentinel.infer --run $RUN sample --split holdout --n 5 --fraud-only
 
-PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh       # GPU API on :8000 in tmux; prints URL + API key
+PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh       # GPU API on :8000 (auto-restarts); waits until healthy; prints URL + key
+bash hyperstack/check.sh                         # any time: what is running, latest run metrics
 ```
 Check from your PC: `curl http://<VM_IP>:8000/health` (should show `"device": "cuda:0"`).
-To update: `git pull && bash hyperstack/setup_vm.sh`, retrain or re-serve. **Hibernate the VM when done.**
+`train.sh` will not start a second run while one is active (`FORCE=1` replaces it).
+To update: `git pull && bash hyperstack/setup_vm.sh`, then retrain or re-serve. **Hibernate the VM when done.**
 
 ## B. XGBoost benchmark on your machine (Windows/Linux)
 
@@ -77,11 +81,16 @@ curl https://<id>.ngrok-free.app/health
 
 ## C. Dashboard
 
+Always-on (Docker, auto-restart); settings persist in `ui/.env`:
+```powershell
+& uiun_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key from serve.sh>     # http://localhost:8501
+& uiun_service.ps1 -XgbUrl https://<id>.ngrok-free.app                        # optional: XGBoost via ngrok
+```
+Or without Docker:
 ```bash
-pip install -r ui/requirements.txt               # already in the root .venv
 # PowerShell: $env:LLM_URL="http://<VM_IP>:8000"; $env:LLM_API_KEY="<from serve.sh>"
-#             $env:XGB_URL="https://<id>.ngrok-free.app"; $env:XGB_API_KEY="<your key>"
-streamlit run ui/app.py                          # http://localhost:8501 (URLs/keys can also be set in the sidebar)
+#             $env:XGB_URL="http://localhost:8001"; $env:XGB_API_KEY="<xgboost_benchmark/.env>"
+streamlit run ui/app.py                          # URLs/keys can also be changed live in the sidebar
 python -m pytest -q ui/tests                     # headless render test (set UI_TEST_* for the live variant)
 ```
 Tabs: **Overview** (holdout KPIs and acceptance targets OBJ-01/02/03/04/10) · **LLM** (run info, loss, thresholds,
@@ -108,6 +117,13 @@ docker run -d --gpus all -p 8000:8000 -e SENTINEL_API_KEY=... -v "$PWD/output:/a
 Or use compose: `docker compose up -d --build xgboost ui` (your machine), then
 `docker compose --profile gpu up -d --build llm` (GPU host, set `LLM_RUN=<run>` in `.env`).
 
+## Class-day checklist
+1. Your PC: `docker ps` shows `sentinel-xgb` and `sentinel-ui` as *healthy* (Docker Desktop: *Start when you sign in*).
+2. VM: `bash hyperstack/check.sh --full` prints **ALL GOOD**.
+3. VM: `bash hyperstack/train.sh` → `tail -f output/last_train.log` → `PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh`.
+4. PC: `& uiun_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key>` → open http://localhost:8501. Both dots are green.
+5. Sharing: `ngrok http 8501` for the dashboard (the XGBoost API needs its own `ngrok http 8001` only for remote dashboards).
+
 ## Troubleshooting
 | Symptom | Fix |
 |---|---|
@@ -115,6 +131,8 @@ Or use compose: `docker compose up -d --build xgboost ui` (your machine), then
 | XGBoost offline via ngrok | Is `uvicorn` still running? Is the ngrok URL current (it changes on restart)? Is `XGB_API_KEY` the same? |
 | 401 | Wrong or missing API key in the sidebar |
 | `setup_vm.sh`: `cuda False` | Image driver too old. Use a newer image, or `TORCH_INDEX=https://download.pytorch.org/whl/cu128` |
-| CUDA OOM while training | `--batch-size 8 --grad-accum 2` or `--method qlora` |
+| CUDA OOM while training | Gradient checkpointing is on by default (~2.5 GB). Still OOM: `--batch-size 8 --grad-accum 2` |
+| `train.sh` says a run is in progress | `tail -f output/last_train.log`, or `FORCE=1 bash hyperstack/train.sh ...` to replace it |
+| `serve.sh`: server did not come up | It prints the log tail; usually no finished run yet, or port 8000 already in use (`tmux kill-session -t serve`) |
 
 Plain HTTP with shared keys is for testing only. Put the APIs behind HTTPS before using real data.

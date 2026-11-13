@@ -40,7 +40,7 @@ def load_base(name_or_path: str, method: str, pad_token_id: int):
     """Load the base model with a fresh NUM_LABELS-way head. method: lora | qlora."""
     from transformers import AutoModelForSequenceClassification
 
-    kwargs: dict = {"num_labels": NUM_LABELS, "torch_dtype": pick_dtype()}
+    kwargs: dict = {"num_labels": NUM_LABELS, "dtype": pick_dtype()}
     if method == "qlora":
         if not torch.cuda.is_available():
             raise RuntimeError("QLoRA (4-bit) needs a CUDA GPU; use --method lora on CPU")
