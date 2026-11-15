@@ -1,5 +1,66 @@
 # SENTINEL — fraud-scoring LLM, XGBoost benchmark, and dashboard
 
+## Showcase runbook: 3 models on the GPU, dashboard on your PC (run line by line)
+
+```
+ Hyperstack GPU VM                                  Your PC
+ ┌──────────────────────────────┐                  ┌──────────────────────────────┐
+ │ LoRA     API :8000  (GPU)    │◀────── HTTP ─────│ Dashboard http://localhost:8501│
+ │ XGBoost  API :8001  (GPU)    │◀─────────────────│ Overview · LoRA vs QLoRA ·   │
+ │ QLoRA    API :8002  (GPU)    │◀─────────────────│ Benchmark · Live · Batch ·   │
+ └──────────────────────────────┘   one API key    │ Decision (GO / NO-GO)        │
+                                                   └──────────────────────────────┘
+```
+XGBoost is the model in production today (baseline). LoRA and QLoRA are the new candidates.
+Hyperstack firewall: open inbound TCP **22, 8000, 8001, 8002**.
+
+**1. On the VM** (`ssh ubuntu@<VM_IP>`):
+```bash
+cd sentinel
+git pull
+bash hyperstack/setup_vm.sh                      # safe to re-run; now also installs XGBoost
+bash hyperstack/check.sh --full                  # must end with ALL GOOD
+
+bash hyperstack/train.sh                         # LoRA (~8 min)
+tail -f output/last_train.log                    # wait for "Artifacts in output/...", then Ctrl-C
+bash hyperstack/train.sh --method qlora          # QLoRA (~8 min)
+tail -f output/last_train.log                    # wait again, then Ctrl-C
+bash hyperstack/xgb.sh train                     # XGBoost on the GPU (~1 min) -> output/xgb
+
+PUBLIC_IP=<VM_IP> bash hyperstack/serve_all.sh   # starts LoRA :8000, XGBoost :8001, QLoRA :8002
+bash hyperstack/check.sh                         # all three lines say "API up"
+```
+`serve_all.sh` ends by printing the exact line to run on your PC (with the API key filled in).
+
+**2. On your PC** (PowerShell, in `D:\finetuning`):
+```powershell
+git pull
+& ui\run_service.ps1 -VmIp <VM_IP> -Key <key> -Rebuild   # -Rebuild only the first time after a pull
+start http://localhost:8501                              # three green dots in the sidebar
+```
+No Docker? Run it directly instead:
+```powershell
+$env:LORA_URL="http://<VM_IP>:8000"; $env:QLORA_URL="http://<VM_IP>:8002"; $env:XGB_URL="http://<VM_IP>:8001"
+$env:LLM_API_KEY="<key>"; $env:XGB_API_KEY="<key>"
+streamlit run ui/app.py
+```
+
+**3. The demo, tab by tab:** Overview (KPIs for all three) → LoRA vs QLoRA (training time, loss, thresholds) →
+Benchmark (PR/ROC curves, Δ vs XGBoost) → Live Test (score a scenario on all three; do **at least 5 calls** so the
+latency check fills in) → Batch Test (200 labelled holdout rows on all three) → **Decision**: GO (deploy the best
+candidate) or NO-GO (keep XGBoost), with the checklist below it. Click **Download decision report** for the meeting notes.
+The targets (recall ≥ 85 %, precision at BLOCK ≥ 70 %, PR-AUC ≥ 0.80, uplift ≥ +0.03, no worse false-positive rate,
+p99 ≤ 250 ms) can be changed in the sidebar under *Acceptance targets*.
+
+**4. Optional: copy the trained models to your PC** (Git Bash or PowerShell):
+```bash
+scp -r ubuntu@<VM_IP>:sentinel/output ./output-from-vm   # LoRA + QLoRA run folders and output/xgb
+```
+
+**5. When done:** `tmux kill-server` on the VM, then **hibernate the VM**.
+
+---
+
 ```
  Hyperstack GPU VM                 Your machine                         Anyone with the links
  ┌───────────────────────┐        ┌────────────────────────────┐       ┌──────────────────────┐
@@ -83,8 +144,10 @@ curl https://<id>.ngrok-free.app/health
 
 Always-on (Docker, auto-restart); settings persist in `ui/.env`:
 ```powershell
-& uiun_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key from serve.sh>     # http://localhost:8501
-& uiun_service.ps1 -XgbUrl https://<id>.ngrok-free.app                        # optional: XGBoost via ngrok
+& ui
+un_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key from serve.sh>     # http://localhost:8501
+& ui
+un_service.ps1 -XgbUrl https://<id>.ngrok-free.app                        # optional: XGBoost via ngrok
 ```
 Or without Docker:
 ```bash
@@ -121,7 +184,8 @@ Or use compose: `docker compose up -d --build xgboost ui` (your machine), then
 1. Your PC: `docker ps` shows `sentinel-xgb` and `sentinel-ui` as *healthy* (Docker Desktop: *Start when you sign in*).
 2. VM: `bash hyperstack/check.sh --full` prints **ALL GOOD**.
 3. VM: `bash hyperstack/train.sh` → `tail -f output/last_train.log` → `PUBLIC_IP=<VM_IP> bash hyperstack/serve.sh`.
-4. PC: `& uiun_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key>` → open http://localhost:8501. Both dots are green.
+4. PC: `& ui
+un_service.ps1 -LlmUrl http://<VM_IP>:8000 -LlmKey <key>` → open http://localhost:8501. Both dots are green.
 5. Sharing: `ngrok http 8501` for the dashboard (the XGBoost API needs its own `ngrok http 8001` only for remote dashboards).
 
 ## Troubleshooting
@@ -130,6 +194,8 @@ Or use compose: `docker compose up -d --build xgboost ui` (your machine), then
 | Dashboard shows LLM offline | VM firewall needs TCP 8000; `tmux ls` on the VM should list `serve`; check the key |
 | XGBoost offline via ngrok | Is `uvicorn` still running? Is the ngrok URL current (it changes on restart)? Is `XGB_API_KEY` the same? |
 | 401 | Wrong or missing API key in the sidebar |
+| Dashboard shows QLoRA or XGBoost offline | VM firewall needs TCP 8002 / 8001; `tmux ls` should list `serve-8002` / `xgb`; `serve_all.sh` skips a model that has no finished run |
+| Decision says *pending* | A model is offline, or fewer than 5 Live Test calls have been made (latency check) |
 | `setup_vm.sh`: `cuda False` | Image driver too old. Use a newer image, or `TORCH_INDEX=https://download.pytorch.org/whl/cu128` |
 | CUDA OOM while training | Gradient checkpointing is on by default (~2.5 GB). Still OOM: `--batch-size 8 --grad-accum 2` |
 | `train.sh` says a run is in progress | `tail -f output/last_train.log`, or `FORCE=1 bash hyperstack/train.sh ...` to replace it |

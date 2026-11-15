@@ -3,6 +3,8 @@
 import html
 
 LLM_COLOR = "#007AFF"   # iOS blue
+LORA_COLOR = LLM_COLOR
+QLORA_COLOR = "#AF52DE"  # iOS purple
 XGB_COLOR = "#FF9500"   # iOS orange
 GREEN, ORANGE, RED, GRAY = "#34C759", "#FF9500", "#FF3B30", "#8E8E93"
 
@@ -38,6 +40,9 @@ h1, h2, h3 { letter-spacing: -0.02em; color: #1C1C1E; }
 .p-block { background: #FFE9E8; color: #D70015; }
 .p-gray { background: #EFEFF4; color: #3A3A3C; }
 .p-blue { background: #E6F0FF; color: #0062CC; }
+.verdict { border-radius: 18px; padding: 18px 22px; margin-bottom: 12px; color: #fff; }
+.verdict h2 { color: #fff; margin: 0; font-size: 30px; }
+.v-go { background: #34C759; } .v-nogo { background: #FF3B30; } .v-wait { background: #8E8E93; }
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
 
 .bar { background: #E5E5EA; border-radius: 999px; height: 10px; overflow: hidden; margin: 6px 0 4px; }

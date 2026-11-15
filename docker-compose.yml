@@ -26,7 +26,8 @@ services:
       - path: ./xgboost_benchmark/.env      # same XGB_API_KEY as the xgboost service
         required: false
     environment:
-      - LLM_URL=${LLM_URL:-http://host.docker.internal:8000}
+      - LORA_URL=${LORA_URL:-${LLM_URL:-http://host.docker.internal:8000}}
+      - QLORA_URL=${QLORA_URL:-http://host.docker.internal:8002}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - XGB_URL=${XGB_URL:-http://xgboost:8001}
     extra_hosts: ["host.docker.internal:host-gateway"]

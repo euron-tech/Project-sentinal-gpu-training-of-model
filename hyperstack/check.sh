@@ -19,7 +19,7 @@ echo "[python]"
 if [ -x "$PY" ]; then
   $PY -c "import torch,sys; assert torch.cuda.is_available(); print(torch.__version__, torch.cuda.get_device_name(0))" >/tmp/sentinel_torch 2>&1 \
     && ok "torch + CUDA: $(cat /tmp/sentinel_torch)" || bad "torch cannot use the GPU: $(tail -1 /tmp/sentinel_torch)"
-  $PY -c "import transformers, peft, accelerate, bitsandbytes, sklearn; print('transformers', transformers.__version__, '| peft', peft.__version__, '| bnb', bitsandbytes.__version__)" >/tmp/sentinel_pk 2>&1 \
+  $PY -c "import transformers, peft, accelerate, bitsandbytes, sklearn, xgboost; print('transformers', transformers.__version__, '| peft', peft.__version__, '| bnb', bitsandbytes.__version__, '| xgboost', xgboost.__version__)" >/tmp/sentinel_pk 2>&1 \
     && ok "$(cat /tmp/sentinel_pk)" || bad "python packages: $(tail -1 /tmp/sentinel_pk)"
 else bad ".venv missing (run: bash hyperstack/setup_vm.sh)"; fi
 
@@ -44,8 +44,11 @@ m = json.load(open(sys.argv[1] + "/metrics_holdout.json"))["calibrated"]
 print(f"      holdout PR-AUC {m['pr_auc']:.3f} | ROC-AUC {m['roc_auc']:.3f} | recall@REVIEW {m['at_review']['recall']:.2f} | precision@BLOCK {m['at_block']['precision']:.2f}")
 EOF
 else info "no finished run yet (bash hyperstack/train.sh)"; fi
-if curl -fs localhost:8000/health >/tmp/sentinel_h 2>/dev/null; then ok "LLM API up on :8000 -> $(cat /tmp/sentinel_h)"
-else info "LLM API not running (bash hyperstack/serve.sh)"; fi
+for svc in "LoRA:8000:bash hyperstack/serve.sh lora 8000" "XGBoost:8001:bash hyperstack/xgb.sh serve" "QLoRA:8002:bash hyperstack/serve.sh qlora 8002"; do
+  name=${svc%%:*}; rest=${svc#*:}; port=${rest%%:*}; how=${rest#*:}
+  if curl -fs localhost:$port/health >/tmp/sentinel_h 2>/dev/null; then ok "$name API up on :$port -> $(cut -c1-110 /tmp/sentinel_h)"
+  else info "$name API not running ($how)"; fi
+done
 
 if [ "${1:-}" = "--full" ] && [ -x "$PY" ]; then
   echo "[full]"

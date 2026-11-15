@@ -42,7 +42,8 @@ cuda_ok || fail "PyTorch cannot see the GPU (driver too old?). Pick an image wit
 ok "$($PY -c "import torch;print('torch', torch.__version__, '| CUDA', torch.version.cuda, '|', torch.cuda.get_device_name(0))")"
 
 $PIP install -q -r requirements.txt
-ok "python requirements"
+$PIP install -q -r xgboost_benchmark/requirements.txt
+ok "python requirements (LLM + XGBoost)"
 
 [ -f .env ] || cp .env.example .env
 if grep -q "YOUR-PROJECT" .env; then

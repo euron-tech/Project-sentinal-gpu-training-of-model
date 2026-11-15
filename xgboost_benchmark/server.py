@@ -1,4 +1,4 @@
-"""XGBoost benchmark API (runs on your machine; expose with ngrok).
+"""XGBoost benchmark API (Hyperstack GPU via hyperstack/xgb.sh, or your machine + ngrok).
 
     uvicorn server:app --host 0.0.0.0 --port 8001        # from inside xgboost_benchmark/
 
@@ -56,6 +56,13 @@ class XGBScorer:
         self.cal = self.meta["calibration"]
         self.booster = xgb.Booster()
         self.booster.load_model(self.art / "model.json")
+        self.device = os.getenv("XGB_DEVICE", "cpu")      # "cuda" on the Hyperstack GPU VM
+        if self.device != "cpu":
+            try:
+                self.booster.set_param({"device": self.device})
+            except self.xgb.core.XGBoostError as e:
+                logger.warning("XGB_DEVICE=%s not usable (%s) - using cpu", self.device, e)
+                self.device = "cpu"
         self.features = self.meta["features"]
         self.rng = (0, self.meta["best_iteration"] + 1)
         self.code_idx = {c: [self.features.index(f) for f in fs if f in self.features] for c, fs in REASON_MAP.items()}
@@ -93,7 +100,7 @@ class XGBScorer:
             return json.loads(f.read_text()) if f.exists() else None
         keep = ("best_iteration", "train_rows", "train_fraud", "train_runtime_s", "host", "xgboost")
         return {"kind": "xgboost", "model": f"XGBoost {self.meta.get('xgboost', '')} (hist, depth {self.meta['params']['max_depth']})",
-                "run": self.art.name, "info": {k: self.meta.get(k) for k in keep},
+                "run": self.art.name, "info": {**{k: self.meta.get(k) for k in keep}, "device": self.device},
                 "calibration": self.cal,
                 "metrics": {"validation": read("metrics_validation.json"), "holdout": read("metrics_holdout.json")},
                 "feature_importance": self.meta.get("feature_importance", {})}
@@ -126,7 +133,8 @@ def _split_rows(split: str) -> List[dict]:
 @app.get("/health")
 def health():
     ok = (Path(os.getenv("XGB_ARTIFACTS", HERE / "artifacts")) / "model.json").exists()
-    return {"status": "ok" if ok else "no-model", "kind": "xgboost", "auth_required": bool(os.getenv("XGB_API_KEY"))}
+    return {"status": "ok" if ok else "no-model", "kind": "xgboost", "run": Path(os.getenv("XGB_ARTIFACTS", HERE / "artifacts")).name,
+            "device": os.getenv("XGB_DEVICE", "cpu"), "auth_required": bool(os.getenv("XGB_API_KEY"))}
 
 
 @app.get("/stats", dependencies=[Depends(auth)])
