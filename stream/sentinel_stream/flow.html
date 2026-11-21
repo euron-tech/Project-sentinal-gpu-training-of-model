@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SENTINEL Live Flow</title>
+<style>
+:root {
+  --bg: #F2F2F7; --card: #FFFFFF; --ink: #1C1C1E; --muted: #8E8E93; --line: #D1D1D6; --soft: #EFEFF4;
+  --blue: #007AFF; --purple: #AF52DE; --orange: #FF9500; --green: #34C759; --red: #FF3B30; --teal: #30B0C7;
+  --allow-bg: #E7F8EC; --allow-ink: #1F9D48; --review-bg: #FFF3E0; --review-ink: #C46A00; --block-bg: #FFE9E8; --block-ink: #D70015;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000; --card: #1C1C1E; --ink: #F2F2F7; --muted: #98989F; --line: #3A3A3C; --soft: #2C2C2E;
+    --allow-bg: #12351E; --allow-ink: #5BD97C; --review-bg: #3A2A10; --review-ink: #FFB340; --block-bg: #3D1414; --block-ink: #FF6961;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000000; --card: #1C1C1E; --ink: #F2F2F7; --muted: #98989F; --line: #3A3A3C; --soft: #2C2C2E;
+  --allow-bg: #12351E; --allow-ink: #5BD97C; --review-bg: #3A2A10; --review-ink: #FFB340; --block-bg: #3D1414; --block-ink: #FF6961;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 14px 16px 24px; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 10px; }
+.top h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; color: var(--muted); }
+.live i { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.live.on i { background: var(--green); animation: blink 1.4s infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+.stats { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.stat { background: var(--card); border-radius: 12px; padding: 6px 12px; min-width: 92px; }
+.stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.stat span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.card { background: var(--card); border-radius: 18px; padding: 10px; box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 6px 20px rgba(0,0,0,.04); }
+svg { width: 100%; height: auto; display: block; }
+.edge { fill: none; stroke: var(--line); stroke-width: 2; }
+.edge.flow { stroke-dasharray: 6 8; animation: dash 1.2s linear infinite; }
+@keyframes dash { to { stroke-dashoffset: -28; } }
+.node rect { fill: var(--card); stroke: var(--line); stroke-width: 1.5; transition: stroke .2s; }
+.node .t { font-weight: 700; font-size: 15px; fill: var(--ink); }
+.node .s { font-size: 12px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.node .badge { font-size: 10px; font-weight: 700; letter-spacing: .05em; }
+.node.pulse rect { stroke-width: 3; }
+.node.down rect { stroke-dasharray: 4 4; opacity: .65; }
+.lane { font-size: 11px; fill: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+.feed { margin-top: 12px; }
+.feed h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 4px 6px 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td { padding: 7px 8px; border-top: 1px solid var(--soft); white-space: nowrap; }
+td.wrap { white-space: normal; }
+tr.new { animation: slide .6s ease-out; }
+@keyframes slide { from { background: var(--soft); transform: translateY(-6px); opacity: 0; } }
+.pill { display: inline-block; border-radius: 999px; padding: 2px 10px; font-weight: 600; font-size: 12px; }
+.ALLOW { background: var(--allow-bg); color: var(--allow-ink); }
+.REVIEW { background: var(--review-bg); color: var(--review-ink); }
+.BLOCK { background: var(--block-bg); color: var(--block-ink); }
+.vote { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 3px; background: var(--line); }
+.muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 8px 6px 0; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+@media (max-width: 760px) { .hide-sm { display: none; } .stats { margin-left: 0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1>Live transaction flow</h1>
+    <span class="live" id="live"><i></i><span id="liveText">connecting</span></span>
+    <div class="stats">
+      <div class="stat"><span>Auto traffic</span><b id="sAuto">-</b></div>
+      <div class="stat"><span>Throughput</span><b id="sTps">0.0/s</b></div>
+      <div class="stat"><span>Scored</span><b id="sScored">0</b></div>
+      <div class="stat"><span>Kafka lag</span><b id="sLag">0</b></div>
+      <div class="stat"><span>Blocked</span><b id="sBlock">0</b></div>
+      <div class="stat"><span>Champion</span><b id="sChamp">-</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <svg id="svg" viewBox="0 0 1200 470" role="img" aria-label="Transactions move from the producer through Kafka to the scorer, the models, the decision and the action">
+      <text class="lane" x="80" y="26" text-anchor="middle">Source</text>
+      <text class="lane" x="265" y="26" text-anchor="middle">Kafka</text>
+      <text class="lane" x="455" y="26" text-anchor="middle">Stream scorer</text>
+      <text class="lane" x="665" y="26" text-anchor="middle">Models (Hyperstack GPU)</text>
+      <text class="lane" x="875" y="26" text-anchor="middle">Decision</text>
+      <text class="lane" x="1100" y="26" text-anchor="middle">Further action</text>
+      <g id="edges"></g><g id="nodes"></g><g id="particles"></g>
+    </svg>
+    <div class="legend">
+      <span><i style="background:var(--blue)"></i>transaction in flight</span>
+      <span><i style="background:var(--green)"></i>ALLOW: non-fraud, approved</span>
+      <span><i style="background:var(--orange)"></i>REVIEW: step-up + analyst</span>
+      <span><i style="background:var(--red)"></i>BLOCK: blocked + alert</span>
+      <span><i style="background:var(--line)"></i>small dots: shadow models scoring the same transaction</span>
+    </div>
+  </div>
+
+  <div class="card feed">
+    <h2>Latest decisions</h2>
+    <table>
+      <thead><tr class="muted"><td>Time</td><td>Customer</td><td class="hide-sm">Merchant</td><td class="num">Amount</td>
+        <td>Decision</td><td class="hide-sm">Models X·L·Q</td><td class="wrap">Action</td><td class="hide-sm">Truth</td></tr></thead>
+      <tbody id="feed"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(() => {
+  const BASE = location.pathname.replace(/\/flow\/?$/, "").replace(/\/$/, "");
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const DEC_COLOR = { ALLOW: "--green", REVIEW: "--orange", BLOCK: "--red" };
+  const MODEL_COLOR = { xgboost: "--orange", lora: "--blue", qlora: "--purple" };
+  const ACTION_TEXT = { APPROVE: "Non-fraud: approved, no further action",
+                        STEP_UP_AUTH: "Suspicious: OTP step-up + analyst queue",
+                        BLOCK_AND_ALERT: "Fraud: blocked, card frozen, alert sent" };
+  const W = 150, H = 66;
+  const N = {
+    producer: { x: 80,  y: 235, t: "Producer", s: "auto mode" },
+    kafka:    { x: 265, y: 235, t: "Confluent Kafka", s: "sentinel.transactions" },
+    scorer:   { x: 455, y: 235, t: "Stream scorer", s: "consumer group" },
+    xgboost:  { x: 665, y: 95,  t: "XGBoost", s: "" },
+    lora:     { x: 665, y: 235, t: "Qwen LoRA", s: "" },
+    qlora:    { x: 665, y: 375, t: "Qwen QLoRA", s: "" },
+    decision: { x: 875, y: 235, t: "Decision", s: "" },
+    ALLOW:    { x: 1100, y: 95,  t: "Approve", s: "non-fraud" },
+    REVIEW:   { x: 1100, y: 235, t: "Step-up / review", s: "suspicious" },
+    BLOCK:    { x: 1100, y: 375, t: "Block + alert", s: "fraud" },
+  };
+  const E = [["producer","kafka"],["kafka","scorer"],["scorer","xgboost"],["scorer","lora"],["scorer","qlora"],
+             ["xgboost","decision"],["lora","decision"],["qlora","decision"],
+             ["decision","ALLOW"],["decision","REVIEW"],["decision","BLOCK"]];
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+  const edges = {}, nodes = {};
+  const gE = document.getElementById("edges"), gN = document.getElementById("nodes"), gP = document.getElementById("particles");
+  for (const [a, b] of E) {
+    const A = N[a], B = N[b], x1 = A.x + W / 2, x2 = B.x - W / 2, mx = (x1 + x2) / 2;
+    edges[a + ">" + b] = el("path", { class: "edge", d: `M${x1},${A.y} C${mx},${A.y} ${mx},${B.y} ${x2},${B.y}` }, gE);
+  }
+  for (const k in N) {
+    const n = N[k], g = el("g", { class: "node", transform: `translate(${n.x - W / 2},${n.y - H / 2})` }, gN);
+    el("rect", { width: W, height: H, rx: 16 }, g);
+    const dot = el("circle", { cx: 16, cy: 20, r: 5, fill: css("--line") }, g);
+    const t = el("text", { class: "t", x: 28, y: 25 }, g); t.textContent = n.t;
+    const s = el("text", { class: "s", x: 16, y: 47 }, g); s.textContent = n.s;
+    const badge = el("text", { class: "badge", x: W - 12, y: 14, "text-anchor": "end" }, g);
+    nodes[k] = { g, dot, s, badge };
+  }
+  const nodeColor = { producer: "--teal", kafka: "--ink", scorer: "--blue", decision: "--ink",
+                      ALLOW: "--green", REVIEW: "--orange", BLOCK: "--red", ...MODEL_COLOR };
+  for (const k in nodeColor) nodes[k].dot.setAttribute("fill", css(nodeColor[k]));
+
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const SEG_MS = 420;
+  function pulse(k) { const g = nodes[k].g; g.classList.add("pulse"); setTimeout(() => g.classList.remove("pulse"), 260); }
+  function travel(route, color, r, opacity, delay, onEnd) {
+    if (reduce || document.hidden) { onEnd && onEnd(); return; }
+    const c = el("circle", { r, fill: color, opacity: 0 }, gP);
+    if (r > 4) c.style.filter = "drop-shadow(0 0 4px " + color + ")";
+    let i = 0, start = null;
+    const step = ts => {
+      if (start === null) start = ts;
+      const e = edges[route[i]], f = Math.min(1, (ts - start) / SEG_MS);
+      const p = e.getPointAtLength(e.getTotalLength() * (f < .5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2));
+      c.setAttribute("cx", p.x); c.setAttribute("cy", p.y); c.setAttribute("opacity", opacity);
+      if (f >= 1) { pulse(route[i].split(">")[1]); i++; start = ts;
+        if (i >= route.length) { c.remove(); onEnd && onEnd(); return; } }
+      requestAnimationFrame(step);
+    };
+    setTimeout(() => requestAnimationFrame(step), delay);
+  }
+  function animate(ev, delay) {
+    const champ = ev.champion && N[ev.champion] ? ev.champion : null;
+    const blue = css("--blue"), dc = css(DEC_COLOR[ev.decision] || "--muted");
+    const head = ["producer>kafka", "kafka>scorer"];
+    travel(head, blue, 6, 1, delay, () => {
+      for (const m of ["xgboost", "lora", "qlora"]) {
+        if (m !== champ && ev[m + "_decision"])
+          travel(["scorer>" + m, m + ">decision"], css(MODEL_COLOR[m]), 3.5, .55, 0);
+      }
+      if (champ) travel(["scorer>" + champ, champ + ">decision"], blue, 6, 1, 0,
+                        () => travel(["decision>" + ev.decision], dc, 6.5, 1, 0));
+      else travel(["decision>" + ev.decision], dc, 6.5, 1, 0);
+    });
+  }
+
+  const fmtN = n => (n ?? 0).toLocaleString();
+  const money = a => "₹" + Math.round(a || 0).toLocaleString("en-IN");
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const feed = document.getElementById("feed");
+  function addRow(ev) {
+    const tr = document.createElement("tr"); tr.className = "new";
+    const votes = ["xgboost", "lora", "qlora"].map(m => {
+      const d = ev[m + "_decision"]; const col = d ? css(DEC_COLOR[d]) : css("--line");
+      return `<span class="vote" title="${m}: ${d || "not scored"}" style="background:${col}"></span>`; }).join("");
+    const truth = ev.fraud_label == null ? "" : ev.fraud_label ? `<span class="pill BLOCK">fraud</span>` : `<span class="muted">genuine</span>`;
+    tr.innerHTML = `<td class="muted">${new Date(ev.ts * 1000).toLocaleTimeString()}</td><td>${esc(ev.customer_id)}</td>
+      <td class="hide-sm">${esc(ev.merchant_name)}</td><td class="num">${money(ev.amount)}</td>
+      <td><span class="pill ${esc(ev.decision)}">${esc(ev.decision)}</span> <span class="muted">${ev.probability == null ? "" : (100 * ev.probability).toFixed(1) + "%"}</span></td>
+      <td class="hide-sm">${votes}</td><td class="wrap">${esc(ACTION_TEXT[ev.action] || ev.action)}</td><td class="hide-sm">${truth}</td>`;
+    feed.prepend(tr);
+    while (feed.children.length > 14) feed.lastChild.remove();
+  }
+
+  let head = 0, lastScored = null, lastT = null, tps = 0;
+  function render(d) {
+    const p = d.pipeline || {}, m = p.models || {}, t = d.totals || {};
+    const live = document.getElementById("live"), on = p.kafka === "connected";
+    live.classList.toggle("on", on);
+    document.getElementById("liveText").textContent = on ? "live" : (p.kafka || "offline");
+    const now = Date.now();
+    if (lastScored !== null && now > lastT) tps = .6 * tps + .4 * Math.max(0, (t.events - lastScored) / ((now - lastT) / 1000));
+    lastScored = t.events; lastT = now;
+    document.getElementById("sTps").textContent = tps.toFixed(1) + "/s";
+    document.getElementById("sScored").textContent = fmtN(t.events);
+    document.getElementById("sLag").textContent = p.lag == null ? "-" : fmtN(p.lag);
+    document.getElementById("sBlock").textContent = fmtN(t.BLOCK);
+    document.getElementById("sChamp").textContent = p.champion || "-";
+    const pr = p.producer || {};
+    const auto = document.getElementById("sAuto");
+    auto.textContent = pr.running ? "ON" : "OFF";
+    auto.style.color = pr.running ? css("--green") : css("--muted");
+    nodes.producer.s.textContent = pr.error ? "error" : pr.running ? `ON · ${(+pr.rate).toFixed(1)}/s · ${fmtN(pr.sent)}`
+                                                     : "OFF · press Start";
+    nodes.producer.dot.setAttribute("fill", pr.running ? css("--green") : css("--line"));
+    nodes.kafka.s.textContent = p.produced_total == null ? "sentinel.transactions" : "offset " + fmtN(p.produced_total);
+    nodes.scorer.s.textContent = "consumed " + fmtN(p.consumed);
+    for (const k of ["xgboost", "lora", "qlora"]) {
+      const s = m[k] || {}, n = nodes[k];
+      n.g.classList.toggle("down", !s.healthy);
+      n.dot.setAttribute("fill", s.healthy ? css(MODEL_COLOR[k]) : css("--line"));
+      n.s.textContent = !s.enabled ? "not deployed" : s.healthy
+        ? `${s.last_ms == null ? "-" : Math.round(s.last_ms) + " ms"} · ${fmtN(s.scored)}` : (s.status || "offline");
+      n.badge.textContent = s.role ? s.role.toUpperCase() : "";
+      n.badge.setAttribute("fill", s.role === "champion" ? css("--green") : css("--muted"));
+    }
+    nodes.decision.s.textContent = `${fmtN(t.ALLOW)} · ${fmtN(t.REVIEW)} · ${fmtN(t.BLOCK)}`;
+    nodes.ALLOW.s.textContent = "non-fraud · " + fmtN(t.ALLOW);
+    nodes.REVIEW.s.textContent = "suspicious · " + fmtN(t.REVIEW);
+    nodes.BLOCK.s.textContent = "fraud · " + fmtN(t.BLOCK);
+    for (const k in edges) edges[k].classList.toggle("flow", on && tps > 0.05);
+    const evs = d.events || [], gap = evs.length ? Math.min(220, 950 / evs.length) : 0;
+    const sample = evs.length > 25 ? evs.filter((_, i) => i % Math.ceil(evs.length / 25) === 0) : evs;
+    sample.forEach((ev, i) => animate(ev, i * gap));
+    evs.forEach((ev, i) => setTimeout(() => addRow(ev), i * gap + 4 * SEG_MS));
+    head = d.head || head;
+  }
+  async function poll() {
+    try {
+      const r = await fetch(BASE + "/api/flow?since=" + head, { cache: "no-store" });
+      if (r.ok) render(await r.json());
+    } catch (e) {
+      document.getElementById("live").classList.remove("on");
+      document.getElementById("liveText").textContent = "reconnecting";
+    }
+    setTimeout(poll, 1000);
+  }
+  poll();
+})();
+</script>
+</body>
+</html>

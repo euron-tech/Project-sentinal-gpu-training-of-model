@@ -1,4 +1,5 @@
-"""SENTINEL dashboard: LoRA vs QLoRA vs XGBoost — stats, benchmark, live + batch tests, Go / No-Go decision.
+"""SENTINEL dashboard: live Kafka flow, analytics, LoRA vs QLoRA vs XGBoost — stats, benchmark, live + batch tests,
+Go / No-Go decision.
 
     streamlit run ui/app.py
 Endpoints come from env and can be edited in the sidebar:
@@ -6,6 +7,8 @@ Endpoints come from env and can be edited in the sidebar:
   QLORA_URL / QLORA_API_KEY   (key falls back to LLM_API_KEY)         default http://localhost:8002
   XGB_URL   / XGB_API_KEY                                             default http://localhost:8001
 XGBoost is the current production model (baseline). LoRA and QLoRA are the candidates.
+UI_LOCK_CONNECTIONS=1 (set on AWS) hides the URL / key fields so viewers never see the internal API keys.
+Stream / CloudWatch settings: see ui/analytics.py.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from analytics import render_analytics, render_flow  # noqa: E402
 from client import Endpoint  # noqa: E402
 from style import (CSS, DECISION_COLOR, GRAY, LORA_COLOR, QLORA_COLOR, RED, XGB_COLOR,  # noqa: E402
                    decision_pill, dot, esc, kpi, pill, plotly_layout, prob_bar)
@@ -67,7 +71,8 @@ def env(*names, default=""):
 # ------------------------------------------------------------------ sidebar: connections + targets
 with st.sidebar:
     st.markdown('<p class="large-title" style="font-size:24px">Connections</p>', unsafe_allow_html=True)
-    st.caption("All three models run on the Hyperstack GPU VM · XGBoost = current production baseline")
+    LOCKED = os.getenv("UI_LOCK_CONNECTIONS", "") == "1"
+    st.caption("XGBoost = production champion · LoRA / QLoRA (Qwen, trained on Hyperstack) = candidates")
     cfg = {
         "LoRA": (env("LORA_URL", "LLM_URL", default="http://localhost:8000"), env("LORA_API_KEY", "LLM_API_KEY")),
         "QLoRA": (env("QLORA_URL", default="http://localhost:8002"), env("QLORA_API_KEY", "LLM_API_KEY")),
@@ -75,8 +80,11 @@ with st.sidebar:
     }
     EP = {}
     for name in NAMES:
-        url = st.text_input(f"{name} URL", cfg[name][0])
-        key = st.text_input(f"{name} API key", cfg[name][1], type="password")
+        if LOCKED:
+            url, key = cfg[name]
+        else:
+            url = st.text_input(f"{name} URL", cfg[name][0])
+            key = st.text_input(f"{name} API key", cfg[name][1], type="password")
         EP[name] = Endpoint(name, url or "", key or "")
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
@@ -217,8 +225,13 @@ def checks_table(cols):
 
 st.markdown('<p class="large-title">SENTINEL</p><p class="subtitle">Fraud LLM (LoRA · QLoRA) vs XGBoost · '
             'benchmark · live testing · deployment decision</p>', unsafe_allow_html=True)
-t_over, t_ft, t_bench, t_live, t_batch, t_dec = st.tabs(
-    ["Overview", "LoRA vs QLoRA", "Benchmark", "Live Test", "Batch Test", "Decision"])
+t_over, t_flow, t_an, t_ft, t_bench, t_live, t_batch, t_dec = st.tabs(
+    ["Overview", "Live Flow", "Analytics", "LoRA vs QLoRA", "Benchmark", "Live Test", "Batch Test", "Decision"])
+
+with t_flow:
+    render_flow()
+with t_an:
+    render_analytics()
 
 
 # ------------------------------------------------------------------ Overview

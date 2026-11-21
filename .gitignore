@@ -38,3 +38,12 @@ output/
 
 # XGBoost benchmark local data (artifacts/ IS committed)
 xgboost_benchmark/data/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.terraform.tfstate.lock.info
+# infra/**/.terraform.lock.hcl IS committed

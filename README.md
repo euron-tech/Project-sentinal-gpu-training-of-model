@@ -1,4 +1,130 @@
-# SENTINEL — fraud-scoring LLM, XGBoost benchmark, and dashboard
+# SENTINEL — real-time fraud scoring: Confluent Kafka → models on Hyperstack → decision → action, dashboard on AWS
+
+## Architecture
+
+```
+  Hyperstack GPU VM (all models)          Confluent Cloud (Terraform)        AWS us-east-1 (Terraform)
+  ┌────────────────────────────┐          ┌──────────────────────────┐      ┌──────────────────────────────────────┐
+  │ LoRA    API :8000          │          │ env + Basic cluster       │      │ ALB  /        → ui     :8501          │
+  │ XGBoost API :8001          │◀── HTTP ─┤ sentinel.transactions     │      │      /live/*  → stream :8003          │
+  │ QLoRA   API :8002          │  + key   │ sentinel.decisions (7 d)  │◀────▶│ ECS Fargate: ONE task, 2 containers   │
+  │ hyperstack/serve_all.sh    │          │ sentinel.actions          │      │  stream = auto-mode producer + scorer │
+  └────────────────────────────┘          └──────────────────────────┘      │           + analytics API + flow page │
+                                                                           │  ui     = Streamlit dashboard          │
+                                                                           │ ECR · S3 (dataset) · SSM secrets ·     │
+                                                                           │ CloudWatch logs/metrics/alarms · SNS   │
+                                                                           └──────────────────────────────────────┘
+  GitHub ── push to main ──▶ Actions: tests → build + push to ECR → terraform apply → Fargate rollout (OIDC, no AWS keys)
+```
+
+* **All models run on the Hyperstack GPU VM**: training and inference for LoRA, QLoRA and XGBoost.
+* **AWS only hosts the final result**: the dashboard, the analytics, and the stream scorer that calls the Hyperstack
+  APIs. There are no EC2 instances: one Fargate service runs a single task.
+* **Kafka is Confluent Cloud.** Terraform creates its environment, cluster, topics and app key, and destroys them.
+
+**Traffic only flows when you press the button.**
+1. Open the dashboard → **Live Flow** → **Start auto traffic**. Pick a rate, and use **Inject attack** for a
+   fraud-ring burst.
+2. The producer publishes transactions to Confluent Kafka.
+3. The scorer consumes them. XGBoost (champion) decides, while LoRA and QLoRA score the same transactions in shadow.
+4. Each decision triggers an action:
+   * `ALLOW`: **non-fraud, approved, no further action**
+   * `REVIEW`: OTP step-up and analyst queue
+   * `BLOCK`: blocked, card frozen, alert
+5. The animated flow shows every transaction move live. **Stop** ends the traffic.
+
+Actions go to the Kafka topic `sentinel.actions`, and BLOCKs also go to the SNS topic `sentinel-prod-fraud-actions`,
+which is the hook for calling further actions. If no Hyperstack model answers, the transaction is held for REVIEW
+(fail closed).
+
+**Data:** the producer mixes the labelled SFT holdout dataset (copied once to S3) with synthetic traffic: 2,000
+customers, 300 merchants, and fraud rings doing account takeover, card testing, mule accounts and impossible travel.
+Every event carries its ground truth, so live recall and precision are measured on the stream.
+
+### 1. Hyperstack: serve the models
+```bash
+bash hyperstack/serve_all.sh      # LoRA :8000, XGBoost :8001, QLoRA :8002 + prints the API key
+```
+Open inbound TCP 8000-8002 on the Hyperstack firewall. The Fargate task has no fixed IP; the API key protects the
+ports.
+
+### 2. Settings (git-ignored `.env` in the repo root, see `.env.example`)
+```
+CONFLUENT_CLOUD_API_KEY=...        # confluent.cloud -> Settings -> API keys -> Cloud resource management
+CONFLUENT_CLOUD_API_SECRET=...
+TF_VAR_hyperstack_host=<VM_IP>
+TF_VAR_model_api_key=<key from serve_all.sh>
+SUPABASE_URL=... / SUPABASE_KEY=...  # optional: dataset for the producer (else synthetic only)
+```
+
+### 3. One tap
+```powershell
+python scripts/ops.py up            # bootstrap -> ECR -> images -> dataset -> Confluent + AWS (terraform) -> URLs
+python scripts/ops.py status        # URLs + ECS service health
+python scripts/ops.py deploy        # redeploy after a change (CI does this on every push to main)
+python scripts/ops.py down          # destroy everything this project created (type sentinel-prod to confirm)
+python scripts/ops.py down --all    # ... and the bootstrap stack (Terraform state bucket + GitHub deploy role)
+python scripts/ops.py audit         # list anything still tagged Project=sentinel
+```
+
+**Destroy is scoped to this project:**
+* The project has its own VPC, its own Terraform state and its own Confluent environment, and every name starts with
+  `sentinel-prod`.
+* Every AWS resource is tagged `Project=sentinel`.
+* ECR repos and S3 buckets are force-deleted with their contents.
+* Terraform even owns the Container Insights log group, so it is removed too.
+* The account-wide GitHub OIDC provider is only created (and later removed) if the account did not already have one.
+
+Nothing else in the AWS or Confluent account is touched.
+
+### CI/CD (GitHub Actions)
+| Workflow | Trigger | Does |
+|---|---|---|
+| `ci.yml` | every PR / push | stream, XGBoost, dashboard and LLM tests; `terraform fmt` + `validate` |
+| `deploy.yml` | push to `main`, manual | ci → assume the OIDC role → `python scripts/ops.py deploy --tag <sha>` |
+| `destroy.yml` | manual, type `sentinel-prod` | `python scripts/ops.py down -y` |
+
+`ops.py up` sets up GitHub for you (it needs `gh` logged in):
+* Repo variables: `AWS_ROLE_ARN`, `AWS_REGION`, `PROJECT`, `ENVIRONMENT`, `HYPERSTACK_HOST`.
+* Secrets: `CONFLUENT_CLOUD_API_KEY`, `CONFLUENT_CLOUD_API_SECRET`, `MODEL_API_KEY`.
+
+### Monitoring and logging
+* **Dashboard → Live Flow:** start/stop auto traffic, change the rate, inject attack waves, and watch the animated
+  Kafka → scorer → models → decision → action flow with a live decision feed. The flow page alone is at `/live/flow`.
+* **Dashboard → Analytics:** shows the following.
+  * Decisions over time.
+  * Who sends risky traffic: devices, customers, merchants, IPs, fraud rings.
+  * Breakdowns by category, channel, fraud type, hour and city, plus reason codes.
+  * Live model latency, recall, precision and agreement.
+  * Task CPU, memory and disk, plus Fargate CPU / memory from CloudWatch.
+* **CloudWatch:**
+  * Dashboard `sentinel-prod`.
+  * Log groups `/ecs/sentinel-prod/{ui,stream}`.
+  * Alarms go to SNS `sentinel-prod-alerts` (set `TF_VAR_alert_email` to subscribe): task CPU and memory, unhealthy
+    dashboard, ALB 5xx, Hyperstack models unreachable, Kafka lag, fraud spike.
+* The analytics store is rebuilt from `sentinel.decisions` (kept 7 days) whenever the task restarts, so history
+  survives redeploys.
+
+### Cost (approximate, if left running)
+| Item | Cost |
+|---|---|
+| Fargate 1 vCPU / 2 GB | ~$36 / month |
+| ALB | ~$18 / month |
+| CloudWatch | a few $ / month |
+| Confluent Basic cluster | usage-based; cents at demo volumes |
+
+`ops.py down` stops all of it. The Hyperstack VM is billed separately.
+
+### Run the pipeline locally
+```bash
+docker compose up -d --build        # local Kafka broker + stream (producer/scorer) + XGBoost + dashboard
+start http://localhost:8501         # Live Flow -> Start auto traffic
+cd stream && python -m pytest -q
+```
+
+---
+
+## Development and training (Hyperstack GPU, local)
 
 ## Showcase runbook: 3 models on the GPU, dashboard on your PC (run line by line)
 

@@ -25,10 +25,11 @@ def _run(env):
 
 def test_renders_offline():
     at = _run({"LLM_URL": "http://127.0.0.1:9", "QLORA_URL": "http://127.0.0.1:9", "XGB_URL": "http://127.0.0.1:9",
-               "LLM_API_KEY": "", "XGB_API_KEY": ""})
-    assert len(at.tabs) == 6
+               "LLM_API_KEY": "", "XGB_API_KEY": "", "STREAM_URL": "http://127.0.0.1:9"})
+    assert len(at.tabs) == 8
     assert any("offline" in m.value for m in at.markdown)
     assert any("Decision pending" in m.value for m in at.markdown)
+    assert any("Kafka" in m.value for m in at.markdown)       # Live Flow tab rendered
 
 
 @pytest.mark.skipif(not os.getenv("UI_TEST_XGB_URL"), reason="set UI_TEST_* env vars to test live services")

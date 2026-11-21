@@ -1,5 +1,8 @@
 # Each service builds from its own folder/Dockerfile and can be deployed on its own.
-#   docker compose up -d --build xgboost ui          # your machine: XGBoost API (8001) + dashboard (8501)
+#   docker compose up -d --build                     # local pipeline: Kafka + stream scorer/producer (8003)
+#                                                    #   + XGBoost API (8001) + dashboard (8501)
+#   (AWS uses Confluent Cloud instead of the local broker; traffic starts with "Start auto traffic" on Live Flow)
+#   docker compose up -d --build xgboost ui          # just XGBoost API + dashboard
 #   docker compose --profile gpu up -d --build llm   # GPU host (Hyperstack): LLM API (8000)
 # Values come from .env in this folder (XGB_API_KEY, LLM_URL, LLM_API_KEY, SENTINEL_API_KEY, LLM_RUN ...).
 services:
@@ -18,6 +21,55 @@ services:
       - ./data/sft:/data/sft
     restart: unless-stopped
 
+  kafka:                                    # local single-node KRaft broker (AWS uses Confluent Cloud)
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+    restart: unless-stopped
+
+  stream:                                   # auto-mode producer + Kafka consumer -> models -> decision -> action,
+                                            # analytics API + flow page
+    build: ./stream
+    image: sentinel-stream
+    ports: ["8003:8003"]
+    env_file:
+      - path: ./xgboost_benchmark/.env      # XGB_API_KEY
+        required: false
+    environment:
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - XGB_URL=http://xgboost:8001
+      - LORA_URL=${LORA_URL:-}
+      - QLORA_URL=${QLORA_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - CHAMPION=${CHAMPION:-xgboost}
+      - CONTROL_API_KEY=${CONTROL_API_KEY:-local-control-key}
+      - EVENTS_PER_SEC=${EVENTS_PER_SEC:-2}
+      - ATTACK_EVERY_S=${ATTACK_EVERY_S:-180}
+      - PRODUCER_SOURCE=${PRODUCER_SOURCE:-synthetic}
+      - AUTO_START=${AUTO_START:-0}
+    volumes:
+      - stream-data:/data
+    depends_on:
+      kafka: {condition: service_healthy}
+    restart: unless-stopped
+
   ui:
     build: ./ui
     image: sentinel-ui
@@ -30,6 +82,9 @@ services:
       - QLORA_URL=${QLORA_URL:-http://host.docker.internal:8002}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - XGB_URL=${XGB_URL:-http://xgboost:8001}
+      - STREAM_URL=http://stream:8003
+      - PUBLIC_STREAM_URL=http://localhost:8003/live
+      - CONTROL_API_KEY=${CONTROL_API_KEY:-local-control-key}
     extra_hosts: ["host.docker.internal:host-gateway"]
     restart: unless-stopped
 
@@ -54,3 +109,6 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+
+volumes:
+  stream-data:

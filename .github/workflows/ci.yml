@@ -1,0 +1,54 @@
+# Tests + Terraform checks on every pull request and push. Also called by deploy.yml before deploying.
+name: ci
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]          # main is tested inside deploy.yml
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [stream, xgboost, ui, llm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: stream (Kafka producer, scorer, analytics API)
+        if: matrix.suite == 'stream'
+        run: |
+          pip install -r stream/requirements.txt
+          cd stream && python -m pytest -q
+      - name: xgboost API
+        if: matrix.suite == 'xgboost'
+        run: |
+          pip install -r xgboost_benchmark/requirements.txt
+          cd xgboost_benchmark && python -m pytest -q tests
+      - name: dashboard (headless render)
+        if: matrix.suite == 'ui'
+        run: |
+          pip install -r ui/requirements.txt
+          python -m pytest -q ui/tests
+      - name: LLM (data, metrics, inference logic; CPU)
+        if: matrix.suite == 'llm'
+        run: |
+          pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          python -m pytest -q tests -m "not smoke"
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check -recursive infra
+      - run: terraform -chdir=infra init -backend=false -input=false && terraform -chdir=infra validate
+      - run: terraform -chdir=infra/bootstrap init -input=false && terraform -chdir=infra/bootstrap validate

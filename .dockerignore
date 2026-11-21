@@ -10,3 +10,8 @@ output/
 ui/
 xgboost_benchmark/
 tests/
+stream/
+infra/
+scripts/
+.github/
+hyperstack/

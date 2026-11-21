@@ -1,0 +1,58 @@
+# Push to main -> tests -> build + push images to ECR -> terraform apply -> ECS rolls out -> wait until stable.
+# One-time setup: run `python scripts/ops.py up` locally; it creates the OIDC deploy role and sets the repository
+# variables (AWS_ROLE_ARN, AWS_REGION, PROJECT, ENVIRONMENT, HYPERSTACK_HOST) and secrets (CONFLUENT_CLOUD_API_KEY,
+# CONFLUENT_CLOUD_API_SECRET, MODEL_API_KEY). No AWS keys are stored in GitHub.
+name: deploy
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ vars.ENVIRONMENT || 'prod' }}   # one Terraform run at a time
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      PROJECT: ${{ vars.PROJECT || 'sentinel' }}
+      ENVIRONMENT: ${{ vars.ENVIRONMENT || 'prod' }}
+      GITHUB_REPO: ${{ github.repository }}
+      TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+      TF_VAR_hyperstack_host: ${{ vars.HYPERSTACK_HOST }}
+      TF_VAR_model_api_key: ${{ secrets.MODEL_API_KEY }}
+      CONFLUENT_CLOUD_API_KEY: ${{ secrets.CONFLUENT_CLOUD_API_KEY }}
+      CONFLUENT_CLOUD_API_SECRET: ${{ secrets.CONFLUENT_CLOUD_API_SECRET }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}       # optional: seeds the labelled dataset into S3 once
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests python-dotenv
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy
+        run: python scripts/ops.py deploy --tag "${GITHUB_SHA::10}"
+      - name: Status
+        if: always()
+        run: python scripts/ops.py status
