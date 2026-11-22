@@ -24,8 +24,6 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
       PROJECT: ${{ vars.PROJECT || 'sentinel' }}
       ENVIRONMENT: ${{ vars.ENVIRONMENT || 'prod' }}
-      CONFLUENT_CLOUD_API_KEY: ${{ secrets.CONFLUENT_CLOUD_API_KEY }}       # to delete the Kafka cluster too
-      CONFLUENT_CLOUD_API_SECRET: ${{ secrets.CONFLUENT_CLOUD_API_SECRET }}
     steps:
       - name: Check confirmation
         if: inputs.confirm != format('{0}-{1}', env.PROJECT, env.ENVIRONMENT)

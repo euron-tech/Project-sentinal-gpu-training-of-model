@@ -1,7 +1,7 @@
 # ECR + S3 dataset bucket + secrets + IAM + ONE ECS Fargate service (no EC2 instances to manage).
 # The task runs two containers that talk over localhost:
 #   ui      :8501  Streamlit dashboard (Live Flow, Analytics, Benchmark, tests, Decision)
-#   stream  :8003  Confluent Kafka producer (auto mode, button-driven) + scorer + analytics API + flow page
+#   stream  :8003  Amazon Kinesis producer (auto mode, button-driven) + scorer + analytics API + flow page
 # The models are NOT on AWS: the scorer and the dashboard call LoRA / XGBoost / QLoRA on the Hyperstack VM.
 
 data "aws_caller_identity" "me" {}
@@ -54,10 +54,8 @@ resource "random_password" "control_key" {
 
 locals {
   secrets = {
-    model-api-key    = var.model_api_key == "" ? "unset" : var.model_api_key
-    control-key      = random_password.control_key.result
-    kafka-api-key    = confluent_api_key.app.id
-    kafka-api-secret = confluent_api_key.app.secret
+    model-api-key = var.model_api_key == "" ? "unset" : var.model_api_key
+    control-key   = random_password.control_key.result
   }
 }
 
@@ -109,6 +107,11 @@ resource "aws_iam_role_policy" "task" {
     { Effect = "Allow", Action = ["s3:ListBucket"], Resource = aws_s3_bucket.data.arn },
     { Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.data.arn}/*" },
     { Effect = "Allow", Action = ["sns:Publish"], Resource = aws_sns_topic.actions.arn },
+    { Effect = "Allow", Resource = [for s in aws_kinesis_stream.this : s.arn], Action = [
+      "kinesis:PutRecord", "kinesis:PutRecords", "kinesis:GetRecords", "kinesis:GetShardIterator",
+    "kinesis:DescribeStreamSummary", "kinesis:DescribeStream", "kinesis:ListShards"] },
+    { Effect = "Allow", Action = ["kms:GenerateDataKey", "kms:Decrypt"], Resource = "*",
+    Condition = { StringEquals = { "kms:ViaService" = "kinesis.${var.region}.amazonaws.com" } } },
     { Effect = "Allow", Action = ["cloudwatch:PutMetricData"], Resource = "*",
     Condition = { StringEquals = { "cloudwatch:namespace" = local.cw_namespace } } },
     { Effect = "Allow", Action = ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"], Resource = "*" },
@@ -144,7 +147,9 @@ locals {
     stream = {
       port = 8003, cpu = 512, memory = 768
       env = {
-        KAFKA_BOOTSTRAP       = local.kafka_bootstrap, XGB_URL = local.model_url.xgb, LORA_URL = local.model_url.lora
+        KINESIS_ENABLED       = "1", STREAM_TRANSACTIONS = aws_kinesis_stream.this["transactions"].name
+        STREAM_DECISIONS      = aws_kinesis_stream.this["decisions"].name
+        XGB_URL               = local.model_url.xgb, LORA_URL = local.model_url.lora
         QLORA_URL             = local.model_url.qlora, CHAMPION = var.champion, CW_NAMESPACE = local.cw_namespace
         SNS_ACTIONS_TOPIC_ARN = aws_sns_topic.actions.arn, STORE_PATH = "/data/sentinel.db", STORE_DIR = "/data"
         AUTO_START            = "0", EVENTS_PER_SEC = tostring(var.events_per_sec), FRAUD_RATE = tostring(var.fraud_rate)
@@ -152,7 +157,6 @@ locals {
       }
       secrets = {
         SENTINEL_API_KEY = local.ssm["model-api-key"], CONTROL_API_KEY = local.ssm["control-key"]
-        KAFKA_API_KEY    = local.ssm["kafka-api-key"], KAFKA_API_SECRET = local.ssm["kafka-api-secret"]
       }
     }
     ui = {
@@ -216,7 +220,7 @@ resource "aws_ecs_service" "app" {
   name            = local.service_name
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 1 # one task: the stream scorer owns the analytics store (rebuilt from Kafka on restart)
+  desired_count   = 1 # one task: the stream scorer owns the analytics store (rebuilt from Kinesis on restart)
   launch_type     = "FARGATE"
   # stop the old task before starting the new one so two scorers never write analytics at the same time
   deployment_minimum_healthy_percent = 0
@@ -226,7 +230,7 @@ resource "aws_ecs_service" "app" {
   network_configuration {
     subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.app.id]
-    assign_public_ip = true # pulls from ECR + reaches Confluent / Hyperstack without a NAT gateway
+    assign_public_ip = true # pulls from ECR + reaches Kinesis / Hyperstack without a NAT gateway
   }
   deployment_circuit_breaker {
     enable   = true
@@ -242,5 +246,5 @@ resource "aws_ecs_service" "app" {
     container_name   = "stream"
     container_port   = 8003
   }
-  depends_on = [aws_lb_listener.http, aws_lb_listener_rule.live, aws_iam_role_policy.task, confluent_kafka_topic.this]
+  depends_on = [aws_lb_listener.http, aws_lb_listener_rule.live, aws_iam_role_policy.task, aws_kinesis_stream.this]
 }

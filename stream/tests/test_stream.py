@@ -1,4 +1,4 @@
-"""Stream service: generator, champion/fallback scoring, store analytics, API. No Kafka, no network."""
+"""Stream service: generator, champion/fallback scoring, store analytics, API, and the Kinesis bus (moto, no network)."""
 
 import sys
 from pathlib import Path
@@ -93,7 +93,7 @@ def _filled_store(n=300):
             r["decision"] = r["xgboost_decision"] = "BLOCK"
             r["reason_codes"] = ["R01_NEW_DEVICE", "R05_AMOUNT_SPIKE"]
     st.insert(recs)
-    st.insert(recs[:10])                                         # duplicates (Kafka redelivery) are ignored
+    st.insert(recs[:10])                                         # duplicates (at-least-once redelivery) are ignored
     return st, evs
 
 
@@ -117,8 +117,8 @@ def test_metrics_counts():
     assert m.c["Transactions"] == 0
 
 
-def test_api_without_kafka(monkeypatch, tmp_path):
-    monkeypatch.delenv("KAFKA_BOOTSTRAP", raising=False)
+def test_api_without_streaming(monkeypatch, tmp_path):
+    monkeypatch.delenv("KINESIS_ENABLED", raising=False)
     monkeypatch.setenv("STORE_PATH", str(tmp_path / "s.db"))
     monkeypatch.setenv("CONTROL_API_KEY", "ck")
     from fastapi.testclient import TestClient
@@ -202,21 +202,83 @@ def test_traffic_starts_only_on_demand_and_stops():
         time.sleep(0.05)
     t.stop()
     assert not t.running and t.sent >= 5 and len(fp.msgs) == t.sent
-    assert fp.msgs[0][0] == "sentinel.transactions"
+    assert fp.msgs[0][0] == "sentinel-transactions"
     n = t.burst(7, "card_testing")
     assert n == 7 and t.attacks == 1
     assert t.start(rate=999)["rate"] == 50.0                  # clamped
     t.stop()
 
 
-def test_kafka_config_confluent_cloud(monkeypatch):
-    from sentinel_stream import kafka_config
+# ------------------------------------------------------------------ Amazon Kinesis (moto: in-memory AWS)
+@pytest.fixture
+def kinesis(monkeypatch):
+    moto = pytest.importorskip("moto")
+    for k, v in {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test", "AWS_DEFAULT_REGION": "ap-south-1",
+                 "AWS_REGION": "ap-south-1"}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("KINESIS_ENDPOINT", raising=False)
+    with moto.mock_aws():
+        from sentinel_stream.bus import ensure_streams, kinesis_client
 
-    monkeypatch.setenv("KAFKA_BOOTSTRAP", "pkc-1.us-east-1.aws.confluent.cloud:9092")
-    monkeypatch.delenv("KAFKA_API_KEY", raising=False)
-    assert kafka_config() == {"bootstrap.servers": "pkc-1.us-east-1.aws.confluent.cloud:9092"}
-    monkeypatch.setenv("KAFKA_API_KEY", "K")
-    monkeypatch.setenv("KAFKA_API_SECRET", "S")
-    c = kafka_config(**{"group.id": "g"})
-    assert c["security.protocol"] == "SASL_SSL" and c["sasl.mechanisms"] == "PLAIN"
-    assert c["sasl.username"] == "K" and c["sasl.password"] == "S" and c["group.id"] == "g"
+        c = kinesis_client()
+        ensure_streams(c, ["sentinel-transactions", "sentinel-decisions"])
+        yield c
+
+
+def _drain(reader, want, seconds=10):
+    import time
+
+    out, t0 = [], time.time()
+    while len(out) < want and time.time() - t0 < seconds:
+        recs, _ = reader.read()
+        out += recs
+        time.sleep(0.05)
+    return out
+
+
+def test_kinesis_producer_and_reader_round_trip(kinesis):
+    import time
+
+    from sentinel_stream.bus import KinesisProducer, ShardReader
+
+    p = KinesisProducer(kinesis)
+    g = SyntheticSource(seed=4)
+    evs = [g.next() for _ in range(620)]                       # > 500: PutRecords is split into two calls
+    for e in evs:
+        p.produce("sentinel-transactions", key=e["customer_id"].encode(), value=e)
+    assert p.poll(0) == 620 and p.sent == 620 and not p.buf    # buffer >= 500 -> sent on poll
+    got = _drain(ShardReader("sentinel-transactions", kinesis, start="TRIM_HORIZON", limit=1000), 620)
+    assert [e["event_id"] for e in got] == [e["event_id"] for e in evs]
+    assert _drain(ShardReader("sentinel-transactions", kinesis, start="LATEST"), 1, seconds=1) == []
+    assert len(_drain(ShardReader("sentinel-transactions", kinesis, start=time.time() - 60, limit=1000), 620)) == 620
+
+
+def test_processor_scores_from_kinesis_and_rebuilds_after_restart(kinesis):
+    import time
+
+    from sentinel_stream.bus import KinesisProducer, ShardReader
+    from sentinel_stream.processor import Processor
+    from sentinel_stream.producer import Traffic
+
+    clients = {"xgboost": FakeClient("xgboost", "BLOCK", 0.97), "lora": FakeClient("lora", "REVIEW", 0.5)}
+    st = Store(":memory:")
+    proc = Processor(st, clients=clients, kinesis=kinesis)
+    proc.start()
+    deadline = time.time() + 10
+    while proc.state["stream"] != "connected" and time.time() < deadline:
+        time.sleep(0.05)
+    t = Traffic(producer=KinesisProducer(kinesis), source=SyntheticSource(seed=8))
+    assert t.burst(12, "account_takeover") == 12               # button "Inject attack" -> Kinesis
+    while st.max_id() < 12 and time.time() < deadline:
+        time.sleep(0.1)
+    proc.stop()
+    proc.join(5)
+    assert st.totals()["events"] == 12 and proc.state["consumed"] == 12
+    recs = st.recent(12)
+    assert {r["decision"] for r in recs} == {"BLOCK"} and {r["action"] for r in recs} == {"BLOCK_AND_ALERT"}
+    out = _drain(ShardReader("sentinel-decisions", kinesis, start="TRIM_HORIZON"), 12)   # downstream consumers
+    assert len(out) == 12 and out[0]["action"] == "BLOCK_AND_ALERT" and out[0]["action_text"].startswith("Fraud")
+
+    fresh = Store(":memory:")                                  # new Fargate task: empty disk
+    assert Processor(fresh, clients=clients, kinesis=kinesis).rebuild() == 12
+    assert fresh.totals()["events"] == 12 and fresh.last_event_ts() > 0

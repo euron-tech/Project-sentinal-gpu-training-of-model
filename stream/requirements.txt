@@ -1,8 +1,7 @@
-confluent-kafka>=2.6
+boto3>=1.35   # Amazon Kinesis Data Streams, SNS, CloudWatch, S3
 fastapi>=0.115
 uvicorn>=0.30
 requests>=2.31
-boto3>=1.35
 psutil>=6.0
 httpx            # FastAPI TestClient
 pytest>=8

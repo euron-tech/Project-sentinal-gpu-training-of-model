@@ -99,15 +99,16 @@ resource "aws_cloudwatch_metric_alarm" "models_unreachable" {
   ok_actions          = local.alarm_actions
 }
 
-resource "aws_cloudwatch_metric_alarm" "consumer_lag" {
-  alarm_name          = "${local.name}-kafka-consumer-lag"
-  namespace           = local.cw_namespace
-  metric_name         = "ConsumerLag"
-  dimensions          = local.stream_dims
+resource "aws_cloudwatch_metric_alarm" "stream_lag" {
+  alarm_name          = "${local.name}-kinesis-iterator-age"
+  alarm_description   = "The scorer is more than 60 s behind the transactions stream"
+  namespace           = "AWS/Kinesis"
+  metric_name         = "GetRecords.IteratorAgeMilliseconds"
+  dimensions          = { StreamName = aws_kinesis_stream.this["transactions"].name }
   statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 2
-  threshold           = 1000
+  threshold           = 60000
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
   alarm_actions       = local.alarm_actions
@@ -132,7 +133,7 @@ resource "aws_cloudwatch_dashboard" "this" {
   dashboard_name = local.name
   dashboard_body = jsonencode({ widgets = [
     { type = "text", x = 0, y = 0, width = 24, height = 2, properties = {
-    markdown = "# SENTINEL ${var.environment}\nConfluent Kafka → stream scorer (Fargate) → XGBoost (champion) + Qwen LoRA / QLoRA (shadow) on Hyperstack → decision → action · [Open dashboard](http://${aws_lb.this.dns_name}) · [Live flow](http://${aws_lb.this.dns_name}/live/flow)" } },
+    markdown = "# SENTINEL ${var.environment}\nAmazon Kinesis → stream scorer (Fargate) → XGBoost (champion) + Qwen LoRA / QLoRA (shadow) on Hyperstack → decision → action · [Open dashboard](http://${aws_lb.this.dns_name}) · [Live flow](http://${aws_lb.this.dns_name}/live/flow)" } },
     { type = "metric", x = 0, y = 2, width = 8, height = 6, properties = {
       title = "Transactions and decisions / min", region = var.region, stat = "Sum", period = 60, view = "timeSeries",
     metrics = [for m in ["Transactions", "Allowed", "Reviewed", "Blocked"] : [local.cw_namespace, m, "Service", "stream"]] } },
@@ -140,8 +141,9 @@ resource "aws_cloudwatch_dashboard" "this" {
       title = "Model latency per transaction (ms)", region = var.region, stat = "Average", period = 60, view = "timeSeries",
     metrics = [for m in ["xgboost", "lora", "qlora"] : [local.cw_namespace, "ScoreLatency", "Model", m]] } },
     { type = "metric", x = 16, y = 2, width = 8, height = 6, properties = {
-      title = "Kafka consumer lag / missed fraud", region = var.region, period = 60, view = "timeSeries",
-      metrics = [[local.cw_namespace, "ConsumerLag", "Service", "stream", { stat = "Maximum" }],
+      title = "Kinesis records in / scorer lag (ms) / missed fraud", region = var.region, period = 60, view = "timeSeries",
+      metrics = [["AWS/Kinesis", "IncomingRecords", "StreamName", aws_kinesis_stream.this["transactions"].name, { stat = "Sum" }],
+        ["AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", "StreamName", aws_kinesis_stream.this["transactions"].name, { stat = "Maximum" }],
     [local.cw_namespace, "FraudMissed", "Service", "stream", { stat = "Sum" }]] } },
     { type = "metric", x = 0, y = 8, width = 8, height = 6, properties = {
       title = "Fargate task CPU / memory %", region = var.region, view = "timeSeries", period = 60, stat = "Average",

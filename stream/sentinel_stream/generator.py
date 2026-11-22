@@ -1,4 +1,4 @@
-"""Transaction sources for the Kafka producer.
+"""Transaction sources for the Kinesis producer.
 
 SyntheticSource  realistic customers, merchants and devices, with fraud rings that inject
                  account takeover, card testing, mule accounts and impossible travel.

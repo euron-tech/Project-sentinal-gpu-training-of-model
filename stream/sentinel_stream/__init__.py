@@ -1,8 +1,9 @@
-"""SENTINEL streaming: Kafka producer -> real-time scorer (champion + shadow models) -> actions + analytics.
+"""SENTINEL streaming: Amazon Kinesis producer -> real-time scorer (champion + shadow models) -> actions + analytics.
 
 Modules
+  bus        - Amazon Kinesis Data Streams producer (PutRecords) and shard reader (GetRecords)
   generator  - synthetic transactions with injected fraud rings, or replay of the labelled SFT dataset
-  producer   - auto-mode traffic generator: publishes transactions to Kafka while switched on (button in the UI)
+  producer   - auto-mode traffic generator: publishes transactions to Kinesis while switched on (button in the UI)
   processor  - consumes, scores on XGBoost (champion) + LoRA/QLoRA (shadow), decides, publishes actions
   store      - SQLite event store + analytics queries
   api        - FastAPI: animated flow page, analytics API, health (runs the processor in a thread)
@@ -10,11 +11,11 @@ Modules
 
 import os
 
-TOPIC_TX = os.getenv("TOPIC_TRANSACTIONS", "sentinel.transactions")
-TOPIC_DECISIONS = os.getenv("TOPIC_DECISIONS", "sentinel.decisions")
-TOPIC_ACTIONS = os.getenv("TOPIC_ACTIONS", "sentinel.actions")
+# Kinesis data stream names (Terraform creates sentinel-<env>-transactions / -decisions)
+STREAM_TX = os.getenv("STREAM_TRANSACTIONS", "sentinel-transactions")
+STREAM_DECISIONS = os.getenv("STREAM_DECISIONS", "sentinel-decisions")
 
-# What happens after each decision. "further action" hooks: Kafka topic sentinel.actions + SNS for BLOCK.
+# What happens after each decision. "further action" hooks: the action fields of every record on the decisions stream + SNS for BLOCK.
 ACTIONS = {
     "ALLOW": {"action": "APPROVE", "label": "Non-fraud", "text": "Non-fraud: payment approved, no further action needed."},
     "REVIEW": {"action": "STEP_UP_AUTH", "label": "Suspicious",
@@ -26,14 +27,3 @@ ACTIONS = {
 
 def action_for(decision: str) -> dict:
     return ACTIONS.get(decision, ACTIONS["REVIEW"])
-
-
-def kafka_config(**extra) -> dict:
-    """librdkafka settings. Confluent Cloud: KAFKA_API_KEY / KAFKA_API_SECRET -> SASL_SSL + PLAIN.
-    Local docker-compose broker: just KAFKA_BOOTSTRAP (plaintext)."""
-    cfg = {"bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")}
-    if os.getenv("KAFKA_API_KEY"):
-        cfg.update({"security.protocol": "SASL_SSL", "sasl.mechanisms": "PLAIN",
-                    "sasl.username": os.environ["KAFKA_API_KEY"], "sasl.password": os.getenv("KAFKA_API_SECRET", "")})
-    cfg.update(extra)
-    return cfg

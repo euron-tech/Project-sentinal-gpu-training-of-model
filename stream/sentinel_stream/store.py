@@ -91,6 +91,10 @@ class Store:
     def max_id(self) -> int:
         return self._rows("SELECT COALESCE(MAX(id), 0) AS m FROM events")[0]["m"]
 
+    def last_event_ts(self) -> float:
+        """Newest event time (POSIX seconds), where the scorer resumes after a restart; 0 when empty."""
+        return float(self._rows("SELECT COALESCE(MAX(ts), 0) AS m FROM events")[0]["m"] or 0)
+
     def recent(self, limit: int = 50, since_id: int = 0) -> List[dict]:
         rows = self._rows("SELECT * FROM events WHERE id > ? ORDER BY id DESC LIMIT ?", (since_id, limit))
         for r in rows:

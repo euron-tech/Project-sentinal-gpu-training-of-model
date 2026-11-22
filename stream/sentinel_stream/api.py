@@ -2,14 +2,15 @@
 
     uvicorn sentinel_stream.api:app --host 0.0.0.0 --port 8003
   GET  /live/health
-  GET  /live/  (/live/flow)        animated end-to-end flow page (Kafka -> models -> decision -> action)
+  GET  /live/  (/live/flow)        animated end-to-end flow page (Kinesis -> models -> decision -> action)
   GET  /live/api/flow?since=<id>   pipeline state + events newer than <id> (polled by the flow page)
   GET  /live/api/summary?minutes=60  application analytics (who sends what, decisions, models, reasons)
   GET  /live/api/events?limit=50   latest scored transactions
   GET  /live/api/system            host CPU / memory / disk of the instance this runs on
   POST /live/api/producer          {"action": "start"|"stop", "rate": 2}   auto-mode traffic   needs X-Control-Key
   POST /live/api/inject            {"n": 20, "fraud_type": "account_takeover"}  one attack wave  needs X-Control-Key
-Env: KAFKA_BOOTSTRAP (+ KAFKA_API_KEY / KAFKA_API_SECRET for Confluent Cloud; processor runs when set),
+Env: KINESIS_ENABLED=1 runs the producer + processor on Amazon Kinesis (STREAM_TRANSACTIONS / _DECISIONS /
+     _ACTIONS, AWS_REGION; KINESIS_ENDPOINT for a local LocalStack),
      STORE_PATH, CONTROL_API_KEY, AUTO_START (0), plus processor / producer env.
 """
 
@@ -46,14 +47,14 @@ def store() -> Store:
 
 @asynccontextmanager
 async def lifespan(_app):
-    if os.getenv("KAFKA_BOOTSTRAP"):
+    if os.getenv("KINESIS_ENABLED") == "1":
         S["processor"] = Processor(store())
         S["processor"].start()
         S["traffic"] = Traffic()
         if os.getenv("AUTO_START", "0") == "1":
             S["traffic"].start()
     else:
-        logger.warning("KAFKA_BOOTSTRAP not set - API only, no stream processing")
+        logger.warning("KINESIS_ENABLED is not 1 - API only, no stream processing")
     yield
     if S.get("traffic"):
         S["traffic"].stop()
@@ -69,7 +70,7 @@ def _pipeline() -> Dict:
     p: Optional[Processor] = S.get("processor")
     t: Optional[Traffic] = S.get("traffic")
     if not p:
-        return {"kafka": "disabled", "models": {}, "consumed": 0, "producer": {"running": False}}
+        return {"stream": "disabled", "models": {}, "consumed": 0, "producer": {"running": False}}
     models = {n: {"enabled": c.enabled, "healthy": bool(c.healthy), "status": c.status, "scored": c.scored,
                   "errors": c.errors, "last_ms": c.last_ms, "role": "champion" if n == p.champion else "shadow"}
               for n, c in p.clients.items()}
@@ -79,7 +80,7 @@ def _pipeline() -> Dict:
 
 @app.get("/live/health")
 def health():
-    return {"status": "ok", "kafka": _pipeline().get("kafka"), "events": store().max_id()}
+    return {"status": "ok", "stream": _pipeline().get("stream"), "events": store().max_id()}
 
 
 @app.get("/live", response_class=HTMLResponse, include_in_schema=False)
@@ -130,7 +131,7 @@ def _control(key: Optional[str]) -> Traffic:
     if not want or not hmac.compare_digest(key or "", want):
         raise HTTPException(401, "missing or invalid X-Control-Key")
     if "traffic" not in S:
-        raise HTTPException(503, "Kafka not configured")
+        raise HTTPException(503, "Kinesis streaming not configured")
     return S["traffic"]
 
 

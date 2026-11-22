@@ -74,16 +74,16 @@ tr.new { animation: slide .6s ease-out; }
       <div class="stat"><span>Auto traffic</span><b id="sAuto">-</b></div>
       <div class="stat"><span>Throughput</span><b id="sTps">0.0/s</b></div>
       <div class="stat"><span>Scored</span><b id="sScored">0</b></div>
-      <div class="stat"><span>Kafka lag</span><b id="sLag">0</b></div>
+      <div class="stat"><span>Stream lag</span><b id="sLag">0</b></div>
       <div class="stat"><span>Blocked</span><b id="sBlock">0</b></div>
       <div class="stat"><span>Champion</span><b id="sChamp">-</b></div>
     </div>
   </div>
 
   <div class="card">
-    <svg id="svg" viewBox="0 0 1200 470" role="img" aria-label="Transactions move from the producer through Kafka to the scorer, the models, the decision and the action">
+    <svg id="svg" viewBox="0 0 1200 470" role="img" aria-label="Transactions move from the producer through Amazon Kinesis to the scorer, the models, the decision and the action">
       <text class="lane" x="80" y="26" text-anchor="middle">Source</text>
-      <text class="lane" x="265" y="26" text-anchor="middle">Kafka</text>
+      <text class="lane" x="265" y="26" text-anchor="middle">Kinesis</text>
       <text class="lane" x="455" y="26" text-anchor="middle">Stream scorer</text>
       <text class="lane" x="665" y="26" text-anchor="middle">Models (Hyperstack GPU)</text>
       <text class="lane" x="875" y="26" text-anchor="middle">Decision</text>
@@ -121,7 +121,7 @@ tr.new { animation: slide .6s ease-out; }
   const W = 150, H = 66;
   const N = {
     producer: { x: 80,  y: 235, t: "Producer", s: "auto mode" },
-    kafka:    { x: 265, y: 235, t: "Confluent Kafka", s: "sentinel.transactions" },
+    kinesis:    { x: 265, y: 235, t: "Amazon Kinesis", s: "transactions stream" },
     scorer:   { x: 455, y: 235, t: "Stream scorer", s: "consumer group" },
     xgboost:  { x: 665, y: 95,  t: "XGBoost", s: "" },
     lora:     { x: 665, y: 235, t: "Qwen LoRA", s: "" },
@@ -131,7 +131,7 @@ tr.new { animation: slide .6s ease-out; }
     REVIEW:   { x: 1100, y: 235, t: "Step-up / review", s: "suspicious" },
     BLOCK:    { x: 1100, y: 375, t: "Block + alert", s: "fraud" },
   };
-  const E = [["producer","kafka"],["kafka","scorer"],["scorer","xgboost"],["scorer","lora"],["scorer","qlora"],
+  const E = [["producer","kinesis"],["kinesis","scorer"],["scorer","xgboost"],["scorer","lora"],["scorer","qlora"],
              ["xgboost","decision"],["lora","decision"],["qlora","decision"],
              ["decision","ALLOW"],["decision","REVIEW"],["decision","BLOCK"]];
   const NS = "http://www.w3.org/2000/svg";
@@ -152,7 +152,7 @@ tr.new { animation: slide .6s ease-out; }
     const badge = el("text", { class: "badge", x: W - 12, y: 14, "text-anchor": "end" }, g);
     nodes[k] = { g, dot, s, badge };
   }
-  const nodeColor = { producer: "--teal", kafka: "--ink", scorer: "--blue", decision: "--ink",
+  const nodeColor = { producer: "--teal", kinesis: "--ink", scorer: "--blue", decision: "--ink",
                       ALLOW: "--green", REVIEW: "--orange", BLOCK: "--red", ...MODEL_COLOR };
   for (const k in nodeColor) nodes[k].dot.setAttribute("fill", css(nodeColor[k]));
 
@@ -178,7 +178,7 @@ tr.new { animation: slide .6s ease-out; }
   function animate(ev, delay) {
     const champ = ev.champion && N[ev.champion] ? ev.champion : null;
     const blue = css("--blue"), dc = css(DEC_COLOR[ev.decision] || "--muted");
-    const head = ["producer>kafka", "kafka>scorer"];
+    const head = ["producer>kinesis", "kinesis>scorer"];
     travel(head, blue, 6, 1, delay, () => {
       for (const m of ["xgboost", "lora", "qlora"]) {
         if (m !== champ && ev[m + "_decision"])
@@ -211,15 +211,15 @@ tr.new { animation: slide .6s ease-out; }
   let head = 0, lastScored = null, lastT = null, tps = 0;
   function render(d) {
     const p = d.pipeline || {}, m = p.models || {}, t = d.totals || {};
-    const live = document.getElementById("live"), on = p.kafka === "connected";
+    const live = document.getElementById("live"), on = p.stream === "connected";
     live.classList.toggle("on", on);
-    document.getElementById("liveText").textContent = on ? "live" : (p.kafka || "offline");
+    document.getElementById("liveText").textContent = on ? "live" : (p.stream || "offline");
     const now = Date.now();
     if (lastScored !== null && now > lastT) tps = .6 * tps + .4 * Math.max(0, (t.events - lastScored) / ((now - lastT) / 1000));
     lastScored = t.events; lastT = now;
     document.getElementById("sTps").textContent = tps.toFixed(1) + "/s";
     document.getElementById("sScored").textContent = fmtN(t.events);
-    document.getElementById("sLag").textContent = p.lag == null ? "-" : fmtN(p.lag);
+    document.getElementById("sLag").textContent = p.lag_ms == null ? "-" : (p.lag_ms < 1000 ? p.lag_ms + " ms" : (p.lag_ms / 1000).toFixed(1) + " s");
     document.getElementById("sBlock").textContent = fmtN(t.BLOCK);
     document.getElementById("sChamp").textContent = p.champion || "-";
     const pr = p.producer || {};
@@ -229,7 +229,7 @@ tr.new { animation: slide .6s ease-out; }
     nodes.producer.s.textContent = pr.error ? "error" : pr.running ? `ON · ${(+pr.rate).toFixed(1)}/s · ${fmtN(pr.sent)}`
                                                      : "OFF · press Start";
     nodes.producer.dot.setAttribute("fill", pr.running ? css("--green") : css("--line"));
-    nodes.kafka.s.textContent = p.produced_total == null ? "sentinel.transactions" : "offset " + fmtN(p.produced_total);
+    nodes.kinesis.s.textContent = p.lag_ms == null ? "transactions stream" : "behind " + (p.lag_ms < 1000 ? p.lag_ms + " ms" : (p.lag_ms / 1000).toFixed(1) + " s");
     nodes.scorer.s.textContent = "consumed " + fmtN(p.consumed);
     for (const k of ["xgboost", "lora", "qlora"]) {
       const s = m[k] || {}, n = nodes[k];

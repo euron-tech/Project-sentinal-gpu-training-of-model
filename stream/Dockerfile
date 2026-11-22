@@ -1,7 +1,6 @@
-# SENTINEL stream image: Kafka producer + real-time scorer + analytics API + animated flow page.
+# SENTINEL stream image: Amazon Kinesis producer + real-time scorer + analytics API + animated flow page.
 #   docker build -t sentinel-stream stream
-#   docker run -p 8003:8003 -e KAFKA_BOOTSTRAP=kafka:9092 -e XGB_URL=http://xgb:8001 sentinel-stream            # scorer + API
-#   docker run -e KAFKA_BOOTSTRAP=kafka:9092 sentinel-stream python -m sentinel_stream.producer               # producer
+#   docker run -p 8003:8003 -e KINESIS_ENABLED=1 -e AWS_REGION=ap-south-1 -e XGB_URL=http://xgb:8001 sentinel-stream   # producer + scorer + API
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PIP_DEFAULT_TIMEOUT=300 STORE_PATH=/data/sentinel.db STORE_DIR=/data
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*

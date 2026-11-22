@@ -1,10 +1,10 @@
-"""Live Flow + Analytics tabs: Kafka stream analytics (who sends what, decisions, models) and infrastructure
+"""Live Flow + Analytics tabs: Kinesis stream analytics (who sends what, decisions, models) and infrastructure
 metrics (CloudWatch Container Insights on AWS, host gauges from the stream service everywhere).
 
 Env:
   STREAM_URL         server-side URL of the stream service       default http://localhost:8003
   PUBLIC_STREAM_URL  browser URL of the flow page (iframe)        default STREAM_URL/live  (AWS: /live via the ALB)
-  CONTROL_API_KEY    lets the dashboard inject attack waves into Kafka
+  CONTROL_API_KEY    lets the dashboard inject attack waves into Kinesis
   ECS_CLUSTER, ECS_SERVICES (comma list), ASG_NAME, AWS_REGION, CW_NAMESPACE   -> CloudWatch panels
 """
 
@@ -67,8 +67,8 @@ def _control(path: str, body: dict):
 
 
 def render_flow():
-    st.markdown('<div class="card"><h4>Confluent Kafka → stream scorer → models on Hyperstack → decision → action</h4>'
-                '<div class="muted">Press <b>Start auto traffic</b>: the producer publishes transactions to Kafka, the '
+    st.markdown('<div class="card"><h4>Amazon Kinesis → stream scorer → models on Hyperstack → decision → action</h4>'
+                '<div class="muted">Press <b>Start auto traffic</b>: the producer publishes transactions to Kinesis, the '
                 'scorer consumes them, XGBoost (champion) decides while LoRA and QLoRA score the same transactions in '
                 'shadow mode, and every decision triggers an action: <b>ALLOW</b> = non-fraud, approved, no further '
                 'action · <b>REVIEW</b> = OTP step-up + analyst queue · <b>BLOCK</b> = blocked, card frozen, alert '
@@ -92,7 +92,7 @@ def render_flow():
         c[5].markdown("<br>", unsafe_allow_html=True)
         if c[5].button("Inject attack", use_container_width=True):
             res, e = _control("/live/api/inject", {"n": int(n), **({} if kind == "mixed" else {"fraud_type": kind})})
-            st.error(e) if e else st.success(f"Sent {res.get('sent')} fraud transactions to Kafka")
+            st.error(e) if e else st.success(f"Sent {res.get('sent')} fraud transactions to Kinesis")
         if status and status.get("error"):
             st.error(f"Producer error: {status['error']}")
     components.iframe(f"{PUBLIC_STREAM_URL}/flow", height=900, scrolling=True)
@@ -123,10 +123,10 @@ def cloudwatch(hours: int):
                 "Period": 60, "Stat": "Average"}})
         ns = os.getenv("CW_NAMESPACE", "")
         if ns:
-            for m in ("Transactions", "Blocked", "Reviewed", "ConsumerLag"):
+            for m in ("Transactions", "Blocked", "Reviewed", "StreamLagMs"):
                 queries.append({"Id": f"app{m.lower()}", "Label": f"app|{m}", "MetricStat": {
                     "Metric": {"Namespace": ns, "MetricName": m, "Dimensions": [{"Name": "Service", "Value": "stream"}]},
-                    "Period": 60, "Stat": "Sum" if m != "ConsumerLag" else "Maximum"}})
+                    "Period": 60, "Stat": "Sum" if m != "StreamLagMs" else "Maximum"}})
         end = datetime.now(timezone.utc)
         rows = []
         for i in range(0, len(queries), 500):
@@ -159,7 +159,7 @@ def render_analytics():
         summary.clear(); system.clear(); cloudwatch.clear()
     data, err = summary(minutes)
     if err:
-        st.info(f"Stream service not reachable at {STREAM_URL} ({err}). Start Kafka + the stream service "
+        st.info(f"Stream service not reachable at {STREAM_URL} ({err}). Start the stream service "
                 "(`docker compose up -d`) or deploy to AWS.")
         return
     t = data["totals"]
@@ -171,7 +171,7 @@ def render_analytics():
     k[3].markdown(kpi("Blocked", f"{t.get('block', 0):,}", pct(t.get("block", 0) / n if n else None)), unsafe_allow_html=True)
     k[4].markdown(kpi("Fraud stopped", money(t.get("fraud_amount_stopped")), f"missed {money(t.get('fraud_amount_missed'))}"),
                   unsafe_allow_html=True)
-    k[5].markdown(kpi("End-to-end", f"{t.get('e2e_ms') or 0:.0f} ms", "Kafka in → decision"), unsafe_allow_html=True)
+    k[5].markdown(kpi("End-to-end", f"{t.get('e2e_ms') or 0:.0f} ms", "Kinesis in → decision"), unsafe_allow_html=True)
 
     ts = pd.DataFrame(data["timeseries"])
     if not ts.empty:

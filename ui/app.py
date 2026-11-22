@@ -1,4 +1,4 @@
-"""SENTINEL dashboard: live Kafka flow, analytics, LoRA vs QLoRA vs XGBoost — stats, benchmark, live + batch tests,
+"""SENTINEL dashboard: live Kinesis flow, analytics, LoRA vs QLoRA vs XGBoost — stats, benchmark, live + batch tests,
 Go / No-Go decision.
 
     streamlit run ui/app.py

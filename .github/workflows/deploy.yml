@@ -1,7 +1,6 @@
 # Push to main -> tests -> build + push images to ECR -> terraform apply -> ECS rolls out -> wait until stable.
 # One-time setup: run `python scripts/ops.py up` locally; it creates the OIDC deploy role and sets the repository
-# variables (AWS_ROLE_ARN, AWS_REGION, PROJECT, ENVIRONMENT, HYPERSTACK_HOST) and secrets (CONFLUENT_CLOUD_API_KEY,
-# CONFLUENT_CLOUD_API_SECRET, MODEL_API_KEY). No AWS keys are stored in GitHub.
+# variables (AWS_ROLE_ARN, AWS_REGION, PROJECT, ENVIRONMENT, HYPERSTACK_HOST) and the secret MODEL_API_KEY. No AWS keys are stored in GitHub.
 name: deploy
 on:
   push:
@@ -34,8 +33,6 @@ jobs:
       TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
       TF_VAR_hyperstack_host: ${{ vars.HYPERSTACK_HOST }}
       TF_VAR_model_api_key: ${{ secrets.MODEL_API_KEY }}
-      CONFLUENT_CLOUD_API_KEY: ${{ secrets.CONFLUENT_CLOUD_API_KEY }}
-      CONFLUENT_CLOUD_API_SECRET: ${{ secrets.CONFLUENT_CLOUD_API_SECRET }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}       # optional: seeds the labelled dataset into S3 once
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
     steps:

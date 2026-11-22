@@ -1,4 +1,4 @@
-"""Auto-mode traffic generator: publishes transactions to Kafka (topic sentinel.transactions) while switched on.
+"""Auto-mode traffic generator: publishes transactions to Amazon Kinesis (stream sentinel-<env>-transactions) while switched on.
 
 On AWS it runs inside the stream service and is switched on / off with the "Start auto traffic" button on the
 dashboard's Live Flow tab (POST /live/api/producer). It is OFF until someone presses the button
@@ -7,7 +7,7 @@ dashboard's Live Flow tab (POST /live/api/producer). It is OFF until someone pre
 Standalone (keeps sending until Ctrl-C):
     python -m sentinel_stream.producer
 Env:
-  KAFKA_BOOTSTRAP, KAFKA_API_KEY, KAFKA_API_SECRET   (Confluent Cloud; see sentinel_stream.kafka_config)
+  STREAM_TRANSACTIONS, AWS_REGION   (KINESIS_ENDPOINT + KINESIS_CREATE=1 for a local LocalStack)
   EVENTS_PER_SEC    2           steady rate (Poisson arrivals)
   FRAUD_RATE        0.04        share of synthetic fraud
   ATTACK_EVERY_S    300         while on, a fraud ring fires an attack wave every N seconds (0 = off)
@@ -26,22 +26,21 @@ import threading
 import time
 from typing import Optional
 
-from sentinel_stream import TOPIC_TX, kafka_config
+from sentinel_stream import STREAM_TX
 from sentinel_stream.generator import make_source
 
 logger = logging.getLogger("sentinel.producer")
 
 
 def make_producer():
-    from confluent_kafka import Producer
+    from sentinel_stream.bus import KinesisProducer
 
-    return Producer(kafka_config(**{"linger.ms": 20, "acks": "all", "enable.idempotence": True,
-                                    "client.id": "sentinel-producer"}))
+    return KinesisProducer()
 
 
 def send(producer, events) -> int:
     for e in events:
-        producer.produce(TOPIC_TX, key=(e.get("customer_id") or "").encode(), value=json.dumps(e).encode())
+        producer.produce(STREAM_TX, key=(e.get("customer_id") or "").encode(), value=json.dumps(e).encode())
     producer.poll(0)
     return len(events)
 

@@ -1,5 +1,5 @@
 # Own VPC (nothing shared with other projects), 2 public subnets (the ALB needs two AZs), no NAT gateway.
-# The Fargate task gets a public IP for outbound calls (ECR, Confluent, Hyperstack); its security group only
+# The Fargate task gets a public IP for outbound calls (ECR, Kinesis, Hyperstack); its security group only
 # accepts traffic from the ALB.
 
 data "aws_availability_zones" "available" { state = "available" }

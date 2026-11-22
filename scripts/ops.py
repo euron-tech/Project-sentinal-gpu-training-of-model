@@ -2,7 +2,7 @@
 """SENTINEL one-tap operations (Windows, Linux, macOS, GitHub Actions). Needs: aws, terraform, docker (+ gh optional).
 
     python scripts/ops.py check              # read-only: settings, Hyperstack models, isolation in the region
-    python scripts/ops.py up                 # everything: bootstrap -> Confluent Kafka + AWS (Terraform) -> build +
+    python scripts/ops.py up                 # everything: bootstrap -> AWS incl. Kinesis streams (Terraform) -> build +
                                              #   push images -> copy the labelled dataset to S3 -> print URLs
     python scripts/ops.py deploy [--tag T]   # build + push images, terraform apply, wait (what CI runs on every push)
     python scripts/ops.py dataset [--dir D]  # (re)copy the labelled SFT holdout split to S3 for the producer
@@ -11,7 +11,6 @@
     python scripts/ops.py audit              # list any AWS resource still tagged Project=<project>
 
 Settings come from the environment or the git-ignored .env file in the repo root:
-  CONFLUENT_CLOUD_API_KEY / CONFLUENT_CLOUD_API_SECRET   Confluent Cloud resource-management key (required)
   TF_VAR_hyperstack_host / TF_VAR_model_api_key          Hyperstack VM IP + the key printed by serve_all.sh
   AWS_REGION (ap-south-1), PROJECT (sentinel), ENVIRONMENT (prod), GITHUB_REPO (owner/repo)
 Any Terraform variable can be set as TF_VAR_<name>, e.g. TF_VAR_alert_email=me@example.com.
@@ -95,17 +94,13 @@ class Ctx:
 
 
 # ------------------------------------------------------------------ helpers
-def preflight(need_docker=True, need_confluent=True):
+def preflight(need_docker=True, need_models=True):
     missing = [t for t in ["aws", "terraform"] + (["docker"] if need_docker else []) if not shutil.which(t)]
     if missing:
         sys.exit(f"missing tools on PATH: {', '.join(missing)}")
     if need_docker and subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
         sys.exit("docker is not running")
-    if need_confluent:
-        if not (os.getenv("CONFLUENT_CLOUD_API_KEY") and os.getenv("CONFLUENT_CLOUD_API_SECRET")):
-            sys.exit("Set CONFLUENT_CLOUD_API_KEY and CONFLUENT_CLOUD_API_SECRET (env or .env). It is a Cloud "
-                     "resource-management API key from https://confluent.cloud/settings/api-keys; Terraform uses it "
-                     "to create (and later delete) the Kafka cluster.")
+    if need_models:
         if not os.getenv("TF_VAR_hyperstack_host"):
             print("note: TF_VAR_hyperstack_host is not set - the scorer has no models and holds every transaction "
                   "for REVIEW until you set it (and TF_VAR_model_api_key) and deploy again")
@@ -134,8 +129,6 @@ def check(c: Ctx) -> bool:
     else:
         good(f"AWS identity {json.loads(ident.stdout)['Arn']}  region {c.region}")
 
-    (good("Confluent Cloud API key set") if os.getenv("CONFLUENT_CLOUD_API_KEY") and os.getenv("CONFLUENT_CLOUD_API_SECRET")
-     else bad.append("CONFLUENT_CLOUD_API_KEY / CONFLUENT_CLOUD_API_SECRET missing in .env"))
 
     host, key = os.getenv("TF_VAR_hyperstack_host", ""), os.getenv("TF_VAR_model_api_key", "")
     if not host or not key:
@@ -173,6 +166,8 @@ def check(c: Ctx) -> bool:
             clashes += [f"ALB {n}" for n in aws("elbv2", "describe-load-balancers", "--query", "LoadBalancers[].LoadBalancerName").stdout.split()
                         if n.startswith(c.name)]
             clashes += [f"IAM role {n}" for n in aws("iam", "list-roles", "--query", f"Roles[?starts_with(RoleName,'{c.name}')].RoleName").stdout.split()]
+            clashes += [f"Kinesis stream {n}" for n in aws("kinesis", "list-streams", "--query", "StreamNames").stdout.split()
+                        if n.startswith(c.name + "-")]
             clashes += [f"log group {n}" for n in aws("logs", "describe-log-groups", "--log-group-name-prefix", f"/ecs/{c.name}",
                                                       "--query", "logGroups[].logGroupName").stdout.split()]
             if clashes:
@@ -258,9 +253,7 @@ def bootstrap(c: Ctx):
                      "ENVIRONMENT": c.env, "HYPERSTACK_HOST": os.getenv("TF_VAR_hyperstack_host", "")}.items():
             if v:
                 run(["gh", "variable", "set", k, "--body", v, "-R", c.repo], check=False)
-        for k, env in {"CONFLUENT_CLOUD_API_KEY": "CONFLUENT_CLOUD_API_KEY",
-                       "CONFLUENT_CLOUD_API_SECRET": "CONFLUENT_CLOUD_API_SECRET",
-                       "MODEL_API_KEY": "TF_VAR_model_api_key"}.items():
+        for k, env in {"MODEL_API_KEY": "TF_VAR_model_api_key"}.items():
             if os.getenv(env):     # value goes in via stdin, never on the command line
                 run(["gh", "secret", "set", k, "-R", c.repo], input_=os.environ[env], check=False)
     return out
@@ -303,7 +296,7 @@ def deploy(c: Ctx, tag: str, wait=True, only=None):
          "-target=aws_ecr_repository.this", "-target=aws_s3_bucket.data"])
     build_push(c, tag, only)
     seed_dataset(c)
-    log("terraform apply (Confluent Kafka cluster + topics, ALB, ECS Fargate, CloudWatch)")
+    log("terraform apply (Kinesis streams, VPC, ALB, ECS Fargate, CloudWatch, SNS)")
     run(["terraform", f"-chdir={INFRA}", "apply", "-auto-approve", "-input=false", f"-var=image_tag={tag}"])
     out = tf_outputs()
     if wait and out.get("services"):
@@ -317,14 +310,14 @@ def deploy(c: Ctx, tag: str, wait=True, only=None):
 
 def summary(out: dict):
     log("SENTINEL is deployed")
-    for k in ("dashboard_url", "flow_url", "analytics_api", "cloudwatch_dashboard", "kafka_cluster", "model_urls"):
+    for k in ("dashboard_url", "flow_url", "analytics_api", "cloudwatch_dashboard", "kinesis_streams", "model_urls"):
         if out.get(k):
             print(f"  {k:22s} {out[k]}")
-    print("  Open the dashboard -> Live Flow -> 'Start auto traffic' to send transactions through Kafka.")
+    print("  Open the dashboard -> Live Flow -> 'Start auto traffic' to send transactions through Kinesis.")
 
 
 def dataset(c: Ctx, data_dir=None):
-    preflight(need_docker=False, need_confluent=False)
+    preflight(need_docker=False, need_models=False)
     seed_dataset(c, Path(data_dir) if data_dir else ROOT / "data" / "sft", force=True)
     run(["aws", "ecs", "update-service", "--cluster", c.name, "--service", f"{c.name}-app", "--force-new-deployment",
          "--query", "service.serviceName", "--output", "text"], check=False)
@@ -332,7 +325,7 @@ def dataset(c: Ctx, data_dir=None):
 
 
 def status(c: Ctx):
-    preflight(need_docker=False, need_confluent=False)
+    preflight(need_docker=False, need_models=False)
     tf_init(c)
     out = tf_outputs()
     if not out:
@@ -347,8 +340,8 @@ def status(c: Ctx):
 def down(c: Ctx, all_=False, yes=False):
     preflight(need_docker=False)
     if not yes:
-        ans = input(f"Destroy every resource of '{c.name}' in {c.region} (account {c.account}) and its Confluent "
-                    f"environment? Type the name to confirm: ")
+        ans = input(f"Destroy every resource of '{c.name}' in {c.region} (account {c.account}), "
+                    f"including its Kinesis streams? Type the name to confirm: ")
         if ans.strip() != c.name:
             sys.exit("aborted")
     if subprocess.run(["aws", "s3api", "head-bucket", "--bucket", c.state_bucket], capture_output=True).returncode == 0:
@@ -406,7 +399,7 @@ def main(argv=None):
         bootstrap(c)
         deploy(c, a.tag or git_tag(), wait=not a.no_wait)
     elif a.cmd == "bootstrap":
-        preflight(need_docker=False, need_confluent=False)
+        preflight(need_docker=False, need_models=False)
         bootstrap(c)
     elif a.cmd == "deploy":
         deploy(c, a.tag or git_tag(), wait=not a.no_wait, only=a.only.split(",") if a.only else None)

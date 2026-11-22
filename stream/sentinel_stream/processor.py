@@ -1,18 +1,19 @@
-"""Real-time scorer: Kafka sentinel.transactions -> models -> decision -> action.
+"""Real-time scorer: Kinesis stream <env>-transactions -> models -> decision -> action.
 
 Champion / challenger:
   champion  (CHAMPION, default xgboost) decides. If it is down, the next healthy model decides;
             if every model is down the transaction goes to REVIEW (fail closed, never auto-approve).
   shadow    the other models score the same batch in parallel so the dashboard can compare them live.
 Output:
-  sentinel.decisions   every scored transaction (all model outputs)
-  sentinel.actions     APPROVE / STEP_UP_AUTH / BLOCK_AND_ALERT (the "further action" hook)
-  SNS (optional)       BLOCK actions are published to SNS_ACTIONS_TOPIC_ARN for downstream automation
-  SQLite               analytics store read by the API
-  CloudWatch           custom metrics every 60 s when CW_NAMESPACE is set
-Delivery is at-least-once: offsets are committed after the batch is stored; the store ignores duplicates.
-Restarts (Fargate has no persistent disk): when the store is empty the processor first replays
-sentinel.decisions from the beginning of its retention, so the analytics history survives redeploys.
+  Kinesis <env>-decisions   every scored transaction: all model outputs + the action (APPROVE / STEP_UP_AUTH /
+                            BLOCK_AND_ALERT), the "further action" hook for downstream consumers; kept 24 h
+  SNS (optional)            BLOCK actions are published to SNS_ACTIONS_TOPIC_ARN for downstream automation
+  SQLite                    analytics store read by the API
+  CloudWatch                custom metrics every 60 s when CW_NAMESPACE is set
+Delivery is at-least-once: a batch is stored before it is acknowledged; the store ignores duplicates (event_id).
+Restarts (Fargate has no persistent disk): when the store is empty the processor first replays the decisions
+stream from the start of its retention, then resumes the transactions stream just before the newest decision,
+so the analytics history survives redeploys and in-flight transactions are not lost.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-from sentinel_stream import TOPIC_ACTIONS, TOPIC_DECISIONS, TOPIC_TX, action_for, kafka_config
+from sentinel_stream import STREAM_DECISIONS, STREAM_TX, action_for
 from sentinel_stream.store import MODELS, Store
 
 logger = logging.getLogger("sentinel.processor")
@@ -173,7 +174,7 @@ class Metrics:
             dims = [{"Name": "Service", "Value": self.service}]
             data = [{"MetricName": k, "Dimensions": dims, "Value": float(v), "Unit": "Count"} for k, v in self.c.items()]
             if lag is not None:
-                data.append({"MetricName": "ConsumerLag", "Dimensions": dims, "Value": float(lag), "Unit": "Count"})
+                data.append({"MetricName": "StreamLagMs", "Dimensions": dims, "Value": float(lag), "Unit": "Milliseconds"})
             for m, v in self.lat.items():
                 if v:
                     data.append({"MetricName": "ScoreLatency", "Unit": "Milliseconds",
@@ -184,15 +185,15 @@ class Metrics:
                     self.cw.put_metric_data(Namespace=self.namespace, MetricData=data[i:i + 20])
             except Exception as e:  # noqa: BLE001 - metrics must never stop scoring
                 logger.warning("put_metric_data failed: %s", e)
-        logger.info("metrics %s", json.dumps({**self.c, "lag": lag}))
+        logger.info("metrics %s", json.dumps({**self.c, "lag_ms": lag}))
         self.reset()
 
 
 class Processor(threading.Thread):
-    def __init__(self, store: Store, bootstrap: str = "", clients: Optional[Dict[str, ModelClient]] = None,
-                 champion: Optional[str] = None, group: str = "sentinel-scorer"):
+    def __init__(self, store: Store, clients: Optional[Dict[str, ModelClient]] = None,
+                 champion: Optional[str] = None, kinesis=None):
         super().__init__(daemon=True, name="processor")
-        self.store, self.bootstrap, self.group = store, bootstrap, group
+        self.store, self.kinesis = store, kinesis
         self.clients = clients or clients_from_env()
         self.champion = (champion or os.getenv("CHAMPION", "xgboost")).lower()
         self.batch = int(os.getenv("BATCH_SIZE", "32"))
@@ -202,24 +203,8 @@ class Processor(threading.Thread):
         self.sns_topic = os.getenv("SNS_ACTIONS_TOPIC_ARN", "")
         self.sns = None
         self.last_sns = 0.0
-        self.state = {"kafka": "connecting", "consumed": 0, "produced_total": None, "lag": None,
+        self.state = {"stream": "connecting", "consumed": 0, "lag_ms": None,
                       "last_batch_ts": None, "started": time.time(), "champion": self.champion, "errors": 0}
-
-    def _lag(self, consumer) -> None:
-        try:
-            parts = consumer.assignment()
-            if not parts:
-                return
-            pos = {(p.topic, p.partition): p.offset for p in consumer.position(parts)}
-            lag = total = 0
-            for p in parts:
-                lo, hi = consumer.get_watermark_offsets(p, timeout=2, cached=False)
-                total += hi
-                cur = pos.get((p.topic, p.partition), -1)
-                lag += max(0, hi - (cur if cur >= 0 else hi))
-            self.state["lag"], self.state["produced_total"] = lag, total
-        except Exception as e:  # noqa: BLE001
-            logger.debug("lag check failed: %s", e)
 
     def _notify(self, records: List[dict]):
         blocks = [r for r in records if r["decision"] == "BLOCK"]
@@ -243,10 +228,7 @@ class Processor(threading.Thread):
         if producer is not None:
             for r in records:
                 key = (r.get("customer_id") or "").encode()
-                producer.produce(TOPIC_DECISIONS, key=key, value=json.dumps(r, default=str).encode())
-                producer.produce(TOPIC_ACTIONS, key=key, value=json.dumps(
-                    {"event_id": r["event_id"], "customer_id": r.get("customer_id"), "decision": r["decision"],
-                     "action": r["action"], "text": r["action_text"], "amount": r.get("amount")}).encode())
+                producer.produce(STREAM_DECISIONS, key=key, value=json.dumps(r, default=str).encode())
             producer.poll(0)
         self._notify(records)
         self.metrics.add(records)
@@ -254,77 +236,58 @@ class Processor(threading.Thread):
         self.state["last_batch_ts"] = time.time()
         return records
 
-    def rebuild(self, max_seconds: float = 90) -> int:
-        """Empty store -> reload past decisions from Kafka (no consumer group, nothing committed)."""
-        from confluent_kafka import OFFSET_BEGINNING, Consumer, TopicPartition
+    def _client(self):
+        if self.kinesis is None:
+            from sentinel_stream.bus import kinesis_client
+            self.kinesis = kinesis_client()
+        return self.kinesis
 
-        if self.store.max_id() or os.getenv("REBUILD_FROM_KAFKA", "1") != "1":
+    def rebuild(self, max_seconds: float = 120) -> int:
+        """Empty store -> reload past decisions from the decisions stream (TRIM_HORIZON, read-only)."""
+        from sentinel_stream.bus import ShardReader
+
+        if self.store.max_id() or os.getenv("REBUILD_FROM_STREAM", "1") != "1":
             return 0
-        c = Consumer(kafka_config(**{"group.id": f"{self.group}-rebuild", "enable.auto.commit": False}))
-        try:
-            meta = c.list_topics(TOPIC_DECISIONS, timeout=15).topics.get(TOPIC_DECISIONS)
-            if not meta or meta.error or not meta.partitions:
-                return 0
-            parts = [TopicPartition(TOPIC_DECISIONS, p, OFFSET_BEGINNING) for p in meta.partitions]
-            ends = {tp.partition: c.get_watermark_offsets(tp, timeout=10)[1] for tp in parts}
-            todo = {p for p, hi in ends.items() if hi > 0}
-            c.assign(parts)
-            n, t0, batch = 0, time.time(), []
-            while todo and time.time() - t0 < max_seconds:
-                for m in c.consume(500, timeout=1.0):
-                    if m.error():
-                        continue
-                    try:
-                        batch.append(json.loads(m.value()))
-                    except ValueError:
-                        pass
-                    if m.offset() + 1 >= ends[m.partition()]:
-                        todo.discard(m.partition())
-                if batch:
-                    self.store.insert(batch)
-                    n += len(batch)
-                    batch = []
-            logger.info("Rebuilt the analytics store from %s: %d decisions", TOPIC_DECISIONS, n)
-            self.state["rebuilt"] = n
-            return n
-        finally:
-            c.close()
+        reader = ShardReader(STREAM_DECISIONS, self._client(), start="TRIM_HORIZON", limit=1000)
+        n, t0 = 0, time.time()
+        while time.time() - t0 < max_seconds:
+            recs, caught_up = reader.read()
+            if recs:
+                self.store.insert(recs)
+                n += len(recs)
+            if caught_up:
+                break
+            time.sleep(0.05 if recs else 0.25)
+        logger.info("Rebuilt the analytics store from %s: %d decisions", STREAM_DECISIONS, n)
+        self.state["rebuilt"] = n
+        return n
 
     def run(self):
-        from confluent_kafka import Consumer, KafkaException, Producer
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        from sentinel_stream.bus import KinesisProducer, ShardReader
 
         while not self.stop_evt.is_set():
             try:
+                producer = KinesisProducer(self._client())   # KINESIS_CREATE=1 creates the streams locally
                 self.rebuild()
-                consumer = Consumer(kafka_config(**{"group.id": self.group, "auto.offset.reset": "latest",
-                                                    "enable.auto.commit": False, "session.timeout.ms": 45000}))
-                producer = Producer(kafka_config(**{"linger.ms": 50, "acks": "all"}))
-                consumer.subscribe([TOPIC_TX])
-                logger.info("Consuming %s (champion=%s)", TOPIC_TX, self.champion)
-                last_lag = 0.0
+                last = self.store.last_event_ts()
+                # resume just before the newest decision (duplicates are ignored), else only new traffic
+                reader = ShardReader(STREAM_TX, self._client(), start=(last - 5) if last else "LATEST", limit=self.batch)
+                logger.info("Consuming Kinesis %s (champion=%s)", STREAM_TX, self.champion)
                 while not self.stop_evt.is_set():
-                    msgs = consumer.consume(num_messages=self.batch, timeout=1.0)
-                    self.state["kafka"] = "connected"
-                    events = []
-                    for m in msgs:
-                        if m.error():
-                            logger.warning("kafka: %s", m.error())
-                            continue
-                        try:
-                            events.append(json.loads(m.value()))
-                        except ValueError:
-                            logger.warning("skipping non-JSON message at offset %s", m.offset())
-                    if events:
-                        self.handle(events, producer)
-                        consumer.commit(asynchronous=True)
-                    if time.time() - last_lag > 5:
-                        self._lag(consumer)
-                        last_lag = time.time()
-                    self.metrics.flush(self.state["lag"])
-                consumer.close()
-                producer.flush(5)
-            except (KafkaException, RuntimeError) as e:
-                self.state["kafka"] = f"error: {e}"
+                    events, _ = reader.read()
+                    self.state["stream"] = "connected"
+                    for i in range(0, len(events), self.batch):
+                        self.handle(events[i:i + self.batch], producer)
+                    producer.poll(0)
+                    self.state["lag_ms"] = reader.lag
+                    self.metrics.flush(reader.lag)
+                    if not events:
+                        self.stop_evt.wait(0.25)
+                producer.flush()
+            except (BotoCoreError, ClientError, RuntimeError) as e:
+                self.state["stream"] = f"error: {type(e).__name__}"
                 self.state["errors"] += 1
                 logger.error("processor error, retrying in 5 s: %s", e)
                 time.sleep(5)

@@ -1,0 +1,2 @@
+-r requirements.txt
+moto[kinesis]>=5.0   # in-memory Amazon Kinesis for the tests

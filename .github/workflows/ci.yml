@@ -22,10 +22,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: stream (Kafka producer, scorer, analytics API)
+      - name: stream (Kinesis producer, scorer, analytics API)
         if: matrix.suite == 'stream'
         run: |
-          pip install -r stream/requirements.txt
+          pip install -r stream/requirements-dev.txt
           cd stream && python -m pytest -q
       - name: xgboost API
         if: matrix.suite == 'xgboost'
