@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SENTINEL one-tap operations (Windows, Linux, macOS, GitHub Actions). Needs: aws, terraform, docker (+ gh optional).
 
+    python scripts/ops.py check              # read-only: settings, Hyperstack models, isolation in the region
     python scripts/ops.py up                 # everything: bootstrap -> Confluent Kafka + AWS (Terraform) -> build +
                                              #   push images -> copy the labelled dataset to S3 -> print URLs
     python scripts/ops.py deploy [--tag T]   # build + push images, terraform apply, wait (what CI runs on every push)
@@ -12,7 +13,7 @@
 Settings come from the environment or the git-ignored .env file in the repo root:
   CONFLUENT_CLOUD_API_KEY / CONFLUENT_CLOUD_API_SECRET   Confluent Cloud resource-management key (required)
   TF_VAR_hyperstack_host / TF_VAR_model_api_key          Hyperstack VM IP + the key printed by serve_all.sh
-  AWS_REGION (us-east-1), PROJECT (sentinel), ENVIRONMENT (prod), GITHUB_REPO (owner/repo)
+  AWS_REGION (ap-south-1), PROJECT (sentinel), ENVIRONMENT (prod), GITHUB_REPO (owner/repo)
 Any Terraform variable can be set as TF_VAR_<name>, e.g. TF_VAR_alert_email=me@example.com.
 The models are not deployed to AWS: they run on the Hyperstack GPU VM (hyperstack/serve_all.sh).
 """
@@ -108,6 +109,83 @@ def preflight(need_docker=True, need_confluent=True):
         if not os.getenv("TF_VAR_hyperstack_host"):
             print("note: TF_VAR_hyperstack_host is not set - the scorer has no models and holds every transaction "
                   "for REVIEW until you set it (and TF_VAR_model_api_key) and deploy again")
+
+
+def check(c: Ctx) -> bool:
+    """Verify every setting and that this project cannot collide with anything already in the account/region.
+    Read-only: it creates nothing. Returns False if a blocking problem was found."""
+    import urllib.request
+    bad, warn = [], []
+    good = lambda m: print(f"  \033[32mOK\033[0m   {m}")
+
+    log(f"Checking configuration for {c.name} in {c.region}")
+    for t in ["aws", "terraform", "docker"]:
+        (good(f"{t} found") if shutil.which(t) else bad.append(f"{t} is not installed / not on PATH"))
+    if shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        bad.append("Docker Desktop is not running")
+    if shutil.which("gh") and subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0:
+        good("GitHub CLI logged in (CI/CD variables + secrets will be set)")
+    else:
+        warn.append("GitHub CLI not logged in (`gh auth login`): AWS deploys, but CI/CD is not wired to GitHub")
+
+    ident = subprocess.run(["aws", "sts", "get-caller-identity", "--output", "json"], capture_output=True, text=True)
+    if ident.returncode != 0:
+        bad.append("AWS CLI has no valid credentials (`aws configure` or `aws login`)")
+    else:
+        good(f"AWS identity {json.loads(ident.stdout)['Arn']}  region {c.region}")
+
+    (good("Confluent Cloud API key set") if os.getenv("CONFLUENT_CLOUD_API_KEY") and os.getenv("CONFLUENT_CLOUD_API_SECRET")
+     else bad.append("CONFLUENT_CLOUD_API_KEY / CONFLUENT_CLOUD_API_SECRET missing in .env"))
+
+    host, key = os.getenv("TF_VAR_hyperstack_host", ""), os.getenv("TF_VAR_model_api_key", "")
+    if not host or not key:
+        warn.append("TF_VAR_hyperstack_host / TF_VAR_model_api_key missing: the dashboard deploys but every "
+                    "transaction is held for REVIEW until the models are reachable")
+    else:
+        for name, port in [("LoRA", 8000), ("XGBoost", 8001), ("QLoRA", 8002)]:
+            try:
+                req = urllib.request.Request(f"http://{host}:{port}/health", headers={"X-API-Key": key})
+                urllib.request.urlopen(req, timeout=6).read()
+                good(f"Hyperstack {name} reachable on :{port}")
+            except Exception as e:  # noqa: BLE001
+                warn.append(f"Hyperstack {name} :{port} not reachable ({type(e).__name__}); start serve_all.sh and "
+                            f"open TCP {port} on the Hyperstack firewall")
+
+    if ident.returncode == 0:   # isolation checks (read-only)
+        aws = lambda *a: subprocess.run(["aws", *a, "--region", c.region, "--output", "text"], capture_output=True, text=True)
+        deployed = aws("s3api", "head-bucket", "--bucket", c.state_bucket).returncode == 0
+        vpcs = len(aws("ec2", "describe-vpcs", "--query", "Vpcs[].VpcId").stdout.split())
+        q = aws("service-quotas", "get-service-quota", "--service-code", "vpc", "--quota-code", "L-F678F1CE",
+                "--query", "Quota.Value").stdout.strip()
+        quota = int(float(q)) if q and q != "None" else 5
+        if deployed:
+            good(f"existing {c.name} state found: this is an update of the same stack")
+        elif vpcs >= quota:
+            bad.append(f"{vpcs}/{quota} VPCs already used in {c.region}: raise the VPC quota (this project needs its own)")
+        else:
+            good(f"VPC quota: {vpcs}/{quota} used, this project adds its own isolated VPC (10.40.0.0/16)")
+        if not deployed:
+            clashes = []
+            if c.name in [a.rsplit("/", 1)[-1] for a in aws("ecs", "list-clusters", "--query", "clusterArns").stdout.split()]:
+                clashes.append(f"ECS cluster {c.name}")
+            clashes += [f"ECR {r}" for r in aws("ecr", "describe-repositories", "--query", "repositories[].repositoryName").stdout.split()
+                        if r.startswith(c.name + "/")]
+            clashes += [f"ALB {n}" for n in aws("elbv2", "describe-load-balancers", "--query", "LoadBalancers[].LoadBalancerName").stdout.split()
+                        if n.startswith(c.name)]
+            clashes += [f"IAM role {n}" for n in aws("iam", "list-roles", "--query", f"Roles[?starts_with(RoleName,'{c.name}')].RoleName").stdout.split()]
+            clashes += [f"log group {n}" for n in aws("logs", "describe-log-groups", "--log-group-name-prefix", f"/ecs/{c.name}",
+                                                      "--query", "logGroups[].logGroupName").stdout.split()]
+            if clashes:
+                bad.append("names this project would create already exist (not managed by this project): " + ", ".join(clashes))
+            else:
+                good(f"no existing resource uses the '{c.name}' names: nothing else in {c.region} will be touched")
+
+    for w in warn:
+        print(f"  \033[33mWARN\033[0m {w}")
+    for b in bad:
+        print(f"  \033[31mFAIL\033[0m {b}")
+    print("\n  " + ("\033[32mready to deploy\033[0m" if not bad else "\033[31mfix the FAIL lines, then re-run\033[0m"))
+    return not bad
 
 
 def tf_version() -> tuple:
@@ -302,13 +380,14 @@ def audit(c: Ctx):
 def main(argv=None):
     _load_env(ROOT / ".env")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--region", default=os.getenv("AWS_REGION", "us-east-1"))
+    p.add_argument("--region", default=os.getenv("AWS_REGION", "ap-south-1"))
     p.add_argument("--project", default=os.getenv("PROJECT", "sentinel"))
     p.add_argument("--environment", default=os.getenv("ENVIRONMENT", "prod"))
     p.add_argument("--github-repo", default=os.getenv("GITHUB_REPO") or detect_repo(),
                    help="owner/repo allowed to deploy from GitHub Actions")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("up"); s.add_argument("--tag"); s.add_argument("--no-wait", action="store_true")
+    sub.add_parser("check", help="read-only: verify settings, models and isolation before deploying")
     sub.add_parser("bootstrap")
     s = sub.add_parser("deploy"); s.add_argument("--tag"); s.add_argument("--no-wait", action="store_true")
     s.add_argument("--only", help="comma list of images to rebuild (ui,stream)")
@@ -318,7 +397,11 @@ def main(argv=None):
     sub.add_parser("audit")
     a = p.parse_args(argv)
     c = Ctx(a)
+    if a.cmd == "check":
+        sys.exit(0 if check(c) else 1)
     if a.cmd == "up":
+        if not check(c):
+            sys.exit("pre-deploy check failed - nothing was created")
         preflight()
         bootstrap(c)
         deploy(c, a.tag or git_tag(), wait=not a.no_wait)

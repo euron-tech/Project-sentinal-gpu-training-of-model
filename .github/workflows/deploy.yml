@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
       PROJECT: ${{ vars.PROJECT || 'sentinel' }}
       ENVIRONMENT: ${{ vars.ENVIRONMENT || 'prod' }}
       GITHUB_REPO: ${{ github.repository }}

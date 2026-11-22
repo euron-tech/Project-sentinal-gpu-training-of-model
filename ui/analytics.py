@@ -101,7 +101,7 @@ def render_flow():
 # ------------------------------------------------------------------ CloudWatch
 @st.cache_data(ttl=60, show_spinner=False)
 def cloudwatch(hours: int):
-    cluster, region = os.getenv("ECS_CLUSTER"), os.getenv("AWS_REGION", "us-east-1")
+    cluster, region = os.getenv("ECS_CLUSTER"), os.getenv("AWS_REGION", "ap-south-1")
     services = [s for s in os.getenv("ECS_SERVICES", "").split(",") if s]
     if not cluster or not services:
         return None, "CloudWatch panels appear when the dashboard runs on AWS (ECS_CLUSTER / ECS_SERVICES set)."
